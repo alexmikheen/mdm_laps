@@ -1,0 +1,59 @@
+# GoLAPS YAML Configuration File
+# For non-MDM environments (Linux, Windows without MDM)
+# Place at: /etc/golaps/config.yaml or ./config.yaml
+
+# Required Settings
+admin_user: "example-admin"
+vault_type: "onepassword"  # Options: onepassword, hashicorp, bitwarden, aws, azure
+vault_id: "your-vault-id"
+password_length: 18
+
+# 1Password Settings
+onepassword:
+  service_account_token: ""  # Or use OP_SERVICE_ACCOUNT_TOKEN env var
+
+# HashiCorp Vault Settings
+hashicorp:
+  address: "https://vault.example.com:8200"
+  token: ""  # Or use VAULT_TOKEN env var
+  path: "secret/data/laps"
+
+# Bitwarden Settings
+bitwarden:
+  server_url: "https://api.bitwarden.com"
+  api_key: ""  # Format: client_id:client_secret or use BW_API_KEY env var
+  org_id: ""
+
+# AWS Secrets Manager Settings
+aws:
+  region: "us-east-1"
+  profile: "default"
+  # Or use AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY env vars
+
+# Azure Key Vault Settings
+azure:
+  tenant_id: ""
+  client_id: ""
+  client_secret: ""
+  vault_url: "https://your-vault.vault.azure.net"
+
+# Notification Settings
+notifications:
+  slack:
+    webhook_url: ""  # Or use SLACK_WEBHOOK_URL env var
+  
+  email:
+    smtp_host: "smtp.example.com"
+    smtp_port: 587
+    from: "laps@example.com"
+    to: "security-team@example.com"
+    username: ""
+    password: ""
+
+# Prometheus Metrics
+prometheus:
+  enabled: true
+  port: ":9090"
+
+# Legacy Migration (optional)
+legacy_admin_pass: ""

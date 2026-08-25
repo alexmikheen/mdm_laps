@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadContent</key>
+			<dict>
+				<key>io.github.golaps</key>
+				<dict>
+					<key>Forced</key>
+					<array>
+						<dict>
+							<key>mcx_preference_settings</key>
+							<dict>
+								<key>AdminUser</key>
+								<string>example-admin</string>
+								<key>VaultID</key>
+								<string>your-vault-id</string>
+								<key>VaultType</key>
+								<string>onepassword</string>
+								<key>PasswordLength</key>
+								<integer>18</integer>
+							</dict>
+						</dict>
+					</array>
+				</dict>
+			</dict>
+			<key>PayloadEnabled</key>
+			<true/>
+			<key>PayloadIdentifier</key>
+			<string>io.github.golaps.preferences</string>
+			<key>PayloadType</key>
+			<string>com.apple.ManagedClient.preferences</string>
+			<key>PayloadUUID</key>
+			<string>98B1FE68-B7D4-4DB7-91CF-15FF06AA40C5</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+		</dict>
+	</array>
+	<key>PayloadDescription</key>
+	<string>Configures local administrator password rotation policies and escrow settings.</string>
+	<key>PayloadDisplayName</key>
+	<string>Enterprise LAPS Configuration</string>
+	<key>PayloadIdentifier</key>
+	<string>io.github.golaps.profile</string>
+	<key>PayloadOrganization</key>
+	<string>Example Organization</string>
+	<key>PayloadRemovalDisallowed</key>
+	<false/>
+	<key>PayloadScope</key>
+	<string>System</string>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>216EA7D3-149D-491C-B7B2-C6848DDE3DDB</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+</dict>
+</plist>
