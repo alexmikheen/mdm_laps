@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 Aleksandr Mikheenko
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # ==============================================================================
 # Script Name: build.sh
 # Description: Automates the compilation of the GoLAPS Updater for macOS (arm64)

@@ -1,3 +1,6 @@
+// Copyright 2026 Aleksandr Mikheenko
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // internal/vault/1password.go
 package vault
 

@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 Aleksandr Mikheenko
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # ==============================================================================
 # Script Name: LAPS Execution & Keychain Sync (macOS)
 # Description: Sends a vault token to macOS Keychain and executes the LAPS updater.

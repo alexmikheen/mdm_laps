@@ -1,3 +1,6 @@
+// Copyright 2026 Aleksandr Mikheenko
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Package version carries the single authoritative GoLAPS version string.
 package version
 

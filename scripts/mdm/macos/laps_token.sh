@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 Aleksandr Mikheenko
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # ==============================================================================
 # Script Name: laps_token.sh
 # Description: Injects the vault token, runs pre-rotation account repair, and executes the GoLAPS updater.

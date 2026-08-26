@@ -1,3 +1,6 @@
+# Copyright 2026 Aleksandr Mikheenko
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # GoLAPS YAML Configuration File
 # For non-MDM environments (Linux, Windows without MDM)
 # Place at: /etc/golaps/config.yaml or ./config.yaml

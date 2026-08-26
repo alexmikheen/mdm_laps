@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 Aleksandr Mikheenko
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # Script Name: audit.sh
 # Description: Audits the LAPS Updater installation by verifying the macOS package receipt. Returns 1 if the expected version is not installed, allowing your MDM to deploy the attached PKG.
 # Logs place: stdout (captured by MDM)
