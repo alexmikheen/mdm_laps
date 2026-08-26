@@ -2,10 +2,7 @@
 # ==============================================================================
 # Script Name: build.sh
 # Description: Automates the compilation of the GoLAPS Updater for macOS (arm64)
-#              and Windows (amd64). Automatically detects missing Golang
-#              dependencies, prompts for official installation, downloads the
-#              dependencies at the versions pinned in go.mod, compiles the native
-#              Swift helper (mac_helper), and packages the final binaries into a .pkg.
+# and Windows (amd64). Automatically detects missing Golang dependencies, prompts for official installation, downloads the dependencies at the versions pinned in go.mod, compiles the native Swift helper (mac_helper), and packages the final binaries into a .pkg.
 # Logs place: stdout
 # Required Permissions: User (Write access), Sudo (only if installing Go)
 # ==============================================================================
@@ -18,11 +15,7 @@ MAC_ARCH="arm64"
 WIN_ARCH="amd64"
 RELEASE_DIR="release"
 
-# Single source of truth for where the PKG installs things. The payload is built from these AND
-# they are injected into the audit script, so the two can never drift apart: observed in
-# production, an audit checking a path the payload never delivered made the audit unsatisfiable,
-# and the fleet re-downloaded the package on every check-in while the MDM reported PASS,
-# because the *install* kept succeeding.
+# Single source of truth for where the PKG installs things. The payload is built from these AND they are injected into the audit script, so the two can never drift apart: observed in production, an audit checking a path the payload never delivered made the audit unsatisfiable, and the fleet re-downloaded the package on every check-in while the MDM reported PASS, because the *install* kept succeeding.
 MAC_BINARY_PATH="/usr/local/bin/golaps"
 MAC_HELPER_PATH="/usr/local/bin/mac_helper"
 
@@ -129,9 +122,7 @@ log_message "Starting the GoLAPS build process for version $VERSION..."
 # DYNAMIC VERSION INJECTION
 # ==========================================
 
-# Rewrites a literal in a source file and then proves the rewrite happened. A silent miss here
-# ships a build that misreports its own version, or an audit script that checks something the
-# package never delivers — either way the MDM reinstalls the PKG on every check-in, forever.
+# Rewrites a literal in a source file and then proves the rewrite happened. A silent miss here ships a build that misreports its own version, or an audit script that checks something the package never delivers — either way the MDM reinstalls the PKG on every check-in, forever.
 inject_version() {
     local file="$1"
     local expression="$2"
@@ -200,9 +191,7 @@ swiftc internal/osmgmt/mac_helper.swift -target arm64-apple-macosx12.0 -o "$PAYL
 log_message "Compiling for Windows ($WIN_ARCH)..."
 GOOS=windows GOARCH=$WIN_ARCH go build -ldflags="-s -w" -o "$RELEASE_DIR/golaps_windows_${WIN_ARCH}.exe" ./cmd || log_error_and_exit "Windows compilation failed!"
 
-# Publish a checksum beside the .exe. A Windows launcher that downloads this binary and runs it
-# as SYSTEM on every device should refuse to install one whose SHA-256 it cannot verify.
-# Publish BOTH files together — the .exe alone should be rejected by such a launcher.
+# Publish a checksum beside the .exe. A Windows launcher that downloads this binary and runs it as SYSTEM on every device should refuse to install one whose SHA-256 it cannot verify. Publish BOTH files together — the .exe alone should be rejected by such a launcher.
 (cd "$RELEASE_DIR" && shasum -a 256 "golaps_windows_${WIN_ARCH}.exe" > "golaps_windows_${WIN_ARCH}.exe.sha256") || log_error_and_exit "Failed to generate the Windows binary checksum."
 
 # 7. Compile Go Binary for macOS

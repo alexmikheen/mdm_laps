@@ -21,11 +21,7 @@ func NewManager() Manager {
 	return &WindowsManager{}
 }
 
-// ensureAccountScript creates or rotates the LAPS service account and re-asserts its administrator rights. It runs as one idempotent unit so the account cannot be left half configured between separate commands.
-//
-// Secrets arrive through the environment (LAPS_TARGET_USER / LAPS_NEW_PASS), never as arguments. The old implementation ran `net user <user> <password>`, which puts the password on a command line — the single most widely collected artefact on a Windows endpoint (Sysmon EventID 1 logs CommandLine by default; process environment blocks are not collected). `Set-LocalUser` takes a SecureString, so there is no argv exposure at all.
-//
-// The Administrators group is addressed by its well-known SID S-1-5-32-544: the display name is localised, so the previous `net localgroup Administrators ...` silently did nothing on a non-English Windows — and once its error stopped being discarded it would have failed the run outright on those devices.
+// ensureAccountScript creates or rotates the LAPS service account and re-asserts its administrator rights. It runs as one idempotent unit so the account cannot be left half configured between separate commands. Secrets arrive through the environment (LAPS_TARGET_USER / LAPS_NEW_PASS), never as arguments. The old implementation ran `net user <user> <password>`, which puts the password on a command line — the single most widely collected artefact on a Windows endpoint (Sysmon EventID 1 logs CommandLine by default; process environment blocks are not collected). `Set-LocalUser` takes a SecureString, so there is no argv exposure at all. The Administrators group is addressed by its well-known SID S-1-5-32-544: the display name is localised, so the previous `net localgroup Administrators ...` silently did nothing on a non-English Windows — and once its error stopped being discarded it would have failed the run outright on those devices.
 const ensureAccountScript = `
 $ErrorActionPreference = 'Stop'
 
@@ -90,8 +86,7 @@ if ([string]::IsNullOrWhiteSpace($serial)) {
 Write-Output $serial
 `
 
-// psEncode renders a script for powershell.exe -EncodedCommand (base64 of UTF-16LE).
-// Passing multi-line scripts this way removes every layer of quoting between Go, CreateProcess and the PowerShell parser.
+// psEncode renders a script for powershell.exe -EncodedCommand (base64 of UTF-16LE). Passing multi-line scripts this way removes every layer of quoting between Go, CreateProcess and the PowerShell parser.
 func psEncode(script string) string {
 	var buf bytes.Buffer
 	for _, unit := range utf16.Encode([]rune(script)) {

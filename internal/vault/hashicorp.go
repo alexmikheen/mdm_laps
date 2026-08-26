@@ -92,8 +92,7 @@ func (hc *HashiCorpClient) GetCredentials(ctx context.Context, deviceID, vaultID
 	return res, nil
 }
 
-// StagePendingPassword escrows the candidate password before the device is touched.
-// Read-modify-write so the existing record (current password, legacy data) survives the stage.
+// StagePendingPassword escrows the candidate password before the device is touched. Read-modify-write so the existing record (current password, legacy data) survives the stage.
 func (hc *HashiCorpClient) StagePendingPassword(ctx context.Context, creds *Credentials, deviceID, hostname, vaultID, newLogin, newPassword string) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -145,8 +144,7 @@ func (hc *HashiCorpClient) UpsertCredentials(ctx context.Context, creds *Credent
 		"secure_token": tokenStatus,
 		"updated_at":   time.Now().Unix(),
 	}
-	// The rebuilt map intentionally carries no pending_password: committing the
-	// real password IS the confirming write that retires the staged copy.
+	// The rebuilt map intentionally carries no pending_password: committing the real password IS the confirming write that retires the staged copy.
 
 	// Add legacy credentials if migrating
 	if creds.IsMigration && creds.OldLogin != "" {

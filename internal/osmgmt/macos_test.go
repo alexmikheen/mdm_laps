@@ -11,9 +11,7 @@ import (
 	"testing"
 )
 
-// The distinction this test protects: "macOS said DISABLED" must be separable from "macOS did
-// not answer". Collapsing the two is what let a timed-out status check delete a healthy admin
-// account, because an empty answer read as "this account has no Secure Token".
+// The distinction this test protects: "macOS said DISABLED" must be separable from "macOS did not answer". Collapsing the two is what let a timed-out status check delete a healthy admin account, because an empty answer read as "this account has no Secure Token".
 func TestParseSecureTokenStatus(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -56,8 +54,7 @@ func TestParseSecureTokenStatus(t *testing.T) {
 	}
 }
 
-// A "DISABLED" substring must never be read as enabled: this account list decides whether
-// laps_token.sh deletes laps-bridge, the last crypto-recovery account on the machine.
+// A "DISABLED" substring must never be read as enabled: this account list decides whether laps_token.sh deletes laps-bridge, the last crypto-recovery account on the machine.
 func TestParseSecureTokenStatusDoesNotConfuseDisabledWithEnabled(t *testing.T) {
 	enabled, ok := parseSecureTokenStatus("Secure token is DISABLED for user lapsadmin")
 	if !ok {
@@ -95,8 +92,7 @@ func TestParseLocalUsersEmpty(t *testing.T) {
 	}
 }
 
-// The MDM legacy password belongs to a service admin. Offering it to a human account cannot
-// succeed and only fills the log with -14090 noise that reads like a rights problem.
+// The MDM legacy password belongs to a service admin. Offering it to a human account cannot succeed and only fills the log with -14090 noise that reads like a rights problem.
 func TestIsServiceAccount(t *testing.T) {
 	creds := map[string]string{
 		"lapsadmin":         "pw",
@@ -123,9 +119,7 @@ func TestIsServiceAccount(t *testing.T) {
 	}
 }
 
-// Helper output is logged on the success path now, so every secret the payload carried must be
-// scrubbed from it first: the helper's own lines are safe, but sysadminctl writes to the same
-// stderr and OpenDirectory error descriptions are opaque strings.
+// Helper output is logged on the success path now, so every secret the payload carried must be scrubbed from it first: the helper's own lines are safe, but sysadminctl writes to the same stderr and OpenDirectory error descriptions are opaque strings.
 func TestRedactSecretsMasksEveryPayloadSecret(t *testing.T) {
 	p := SwiftPayload{
 		Action:     "change_password",
@@ -151,9 +145,7 @@ func TestRedactSecretsMasksEveryPayloadSecret(t *testing.T) {
 	}
 }
 
-// An empty secret must never reach strings.ReplaceAll — replacing "" inserts the marker between
-// every character of the output. Payloads legitimately carry empty fields (verify_password has
-// no OldPass or AdminPass), so secrets() has to drop them.
+// An empty secret must never reach strings.ReplaceAll — replacing "" inserts the marker between every character of the output. Payloads legitimately carry empty fields (verify_password has no OldPass or AdminPass), so secrets() has to drop them.
 func TestSecretsSkipsEmptyFields(t *testing.T) {
 	p := SwiftPayload{Action: "verify_password", TargetUser: "jappleseed", TargetPass: "OnlyOne"}
 
@@ -167,10 +159,7 @@ func TestSecretsSkipsEmptyFields(t *testing.T) {
 	}
 }
 
-// The helper's exit codes ARE the contract between the two languages: Go reads them to decide
-// whether to escalate a token holder to recreation. Nothing at build time links the Swift enum to
-// the Go constants, so reordering the Swift cases would silently turn "locked" into "auth-failed"
-// — or worse, "ok". This test parses the helper and asserts the numbers still line up.
+// The helper's exit codes ARE the contract between the two languages: Go reads them to decide whether to escalate a token holder to recreation. Nothing at build time links the Swift enum to the Go constants, so reordering the Swift cases would silently turn "locked" into "auth-failed" — or worse, "ok". This test parses the helper and asserts the numbers still line up.
 func TestChangeOutcomeValuesMatchSwiftHelper(t *testing.T) {
 	src, err := os.ReadFile("mac_helper.swift")
 	if err != nil {
@@ -205,8 +194,7 @@ func TestChangeOutcomeValuesMatchSwiftHelper(t *testing.T) {
 }
 
 func TestChangeOutcomeString(t *testing.T) {
-	// The label reaches the MDM log and is how an operator tells "the password is wrong" apart from
-	// "opendirectoryd refused the reset" — two states that used to look identical.
+	// The label reaches the MDM log and is how an operator tells "the password is wrong" apart from "opendirectoryd refused the reset" — two states that used to look identical.
 	for outcome, want := range map[changeOutcome]string{
 		changeOK:           "ok",
 		changeODError:      "od-error",

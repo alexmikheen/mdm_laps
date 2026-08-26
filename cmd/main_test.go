@@ -33,8 +33,7 @@ func TestTailCapLogTrimsToTheNewestLines(t *testing.T) {
 	if len(lines) != localLogMaxLines {
 		t.Errorf("capped log has %d lines, want %d", len(lines), localLogMaxLines)
 	}
-	// The newest entries are the ones worth keeping — this file exists precisely because the MDM console
-	// throws away everything but the latest run.
+	// The newest entries are the ones worth keeping — this file exists precisely because the MDM console throws away everything but the latest run.
 	if !strings.Contains(string(data), fmt.Sprintf("line %d", localLogMaxLines+500)) {
 		t.Error("the newest line was trimmed away")
 	}
@@ -67,8 +66,7 @@ func TestTailCapLogHandlesMissingFile(t *testing.T) {
 	tailCapLog(filepath.Join(t.TempDir(), "does-not-exist.log"))
 }
 
-// A temporary copy of the log is a second file full of local account names; it must not be left
-// behind under a name nobody rotates.
+// A temporary copy of the log is a second file full of local account names; it must not be left behind under a name nobody rotates.
 func TestTailCapLogLeavesNoTempFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "laps.log")

@@ -31,8 +31,7 @@ func TestGenerateLength(t *testing.T) {
 	}
 }
 
-// The MDM requireAlphanumeric policy rejects a password without all three classes with
-// Code=5402, so this property is the whole reason the generator loops.
+// The MDM requireAlphanumeric policy rejects a password without all three classes with Code=5402, so this property is the whole reason the generator loops.
 func TestGenerateAlwaysMeetsComplexityPolicy(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		got, err := Generate(MinLength)
@@ -51,9 +50,7 @@ func TestGenerateAlwaysMeetsComplexityPolicy(t *testing.T) {
 	}
 }
 
-// The password crosses AppleScript string literals, shell wrappers and sysadminctl argument
-// lists. A quote, backtick or backslash slipping into the charset would break one of them in a
-// way that only shows up on the device that drew the unlucky character.
+// The password crosses AppleScript string literals, shell wrappers and sysadminctl argument lists. A quote, backtick or backslash slipping into the charset would break one of them in a way that only shows up on the device that drew the unlucky character.
 func TestGenerateUsesOnlySafeCharacters(t *testing.T) {
 	const forbidden = "\"'`\\ \t\n"
 

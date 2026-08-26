@@ -12,12 +12,9 @@ import (
 	"time"
 )
 
-// These tests exist because the heal/bridge/dscl ladder shipped to production untested: the
-// last-admin bridge and the dscl build have never fired on the fleet (no machine was left in the
-// right state), so a scripted runner is the only way to prove those branches before they matter.
+// These tests exist because the heal/bridge/dscl ladder shipped to production untested: the last-admin bridge and the dscl build have never fired on the fleet (no machine was left in the right state), so a scripted runner is the only way to prove those branches before they matter.
 
-// fakeExit mimics an *exec.ExitError through the exitCode() interface, so a scripted non-zero
-// exit takes the same path in the code under test as a real process failure.
+// fakeExit mimics an *exec.ExitError through the exitCode() interface, so a scripted non-zero exit takes the same path in the code under test as a real process failure.
 type fakeExit struct{ code int }
 
 func (e fakeExit) Error() string { return fmt.Sprintf("exit status %d", e.code) }
@@ -79,8 +76,7 @@ func newTestManager(f *fakeRunner) *MacOSManager {
 	return &MacOSManager{run: f, sleep: func(time.Duration) {}, prompt: func(context.Context, string, string) bool { return false }}
 }
 
-// fakeOS is the little state machine the scripted runner consults: which accounts exist and which
-// hold a token. Handlers mutate it the way the real commands would.
+// fakeOS is the little state machine the scripted runner consults: which accounts exist and which hold a token. Handlers mutate it the way the real commands would.
 type fakeOS struct {
 	exists map[string]bool
 	token  map[string]bool
@@ -108,9 +104,7 @@ func (o *fakeOS) handleCommon(c call) ([]byte, error, bool) {
 	return nil, nil, false
 }
 
-// TestHealAccountBridgesLastAdminGuard drives the full ladder: the target is the last admin, so
-// the first delete is refused; a bridge admin makes it deletable; the target is recreated INSIDE
-// the bridge window; the token-less bridge is removed afterwards.
+// TestHealAccountBridgesLastAdminGuard drives the full ladder: the target is the last admin, so the first delete is refused; a bridge admin makes it deletable; the target is recreated INSIDE the bridge window; the token-less bridge is removed afterwards.
 func TestHealAccountBridgesLastAdminGuard(t *testing.T) {
 	osState := &fakeOS{exists: map[string]bool{"lapsadmin": true}, token: map[string]bool{}}
 
@@ -250,9 +244,7 @@ func decodePayload(t *testing.T, c call) SwiftPayload {
 	return p
 }
 
-// TestCreateHiddenAdminPhantomRecovery: sysadminctl exits 0 without creating, twice — the account
-// is finally assembled via dscl, sealed with a throwaway password and rotated to the real one over
-// stdin with the administrative reset permitted (the one legitimately token-less case).
+// TestCreateHiddenAdminPhantomRecovery: sysadminctl exits 0 without creating, twice — the account is finally assembled via dscl, sealed with a throwaway password and rotated to the real one over stdin with the administrative reset permitted (the one legitimately token-less case).
 func TestCreateHiddenAdminPhantomRecovery(t *testing.T) {
 	osState := &fakeOS{exists: map[string]bool{}, token: map[string]bool{}}
 	const realPass = "Real-Pass-123"
@@ -313,9 +305,7 @@ func TestCreateHiddenAdminPhantomRecovery(t *testing.T) {
 	}
 }
 
-// The class that poisoned the vault: a token holder whose recorded password no longer works. The
-// helper reports auth-failed/locked and Go must escalate to recreation — never retry the helper
-// with an administrative reset, never report success without recreating.
+// The class that poisoned the vault: a token holder whose recorded password no longer works. The helper reports auth-failed/locked and Go must escalate to recreation — never retry the helper with an administrative reset, never report success without recreating.
 func TestEnsureUserEscalatesFailedRotationToRecreation(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -366,8 +356,7 @@ func TestEnsureUserEscalatesFailedRotationToRecreation(t *testing.T) {
 	}
 }
 
-// reset-refused (and any other non-ok outcome that is not auth-failed/locked) must surface as an
-// error — success here is exactly the phantom PASS that escrowed passwords the device never took.
+// reset-refused (and any other non-ok outcome that is not auth-failed/locked) must surface as an error — success here is exactly the phantom PASS that escrowed passwords the device never took.
 func TestEnsureUserReportsResetRefusedAsError(t *testing.T) {
 	osState := &fakeOS{exists: map[string]bool{"lapsadmin": true}, token: map[string]bool{"lapsadmin": true}}
 
@@ -396,8 +385,7 @@ func TestEnsureUserReportsResetRefusedAsError(t *testing.T) {
 	}
 }
 
-// The pwpolicy gate: a token holder that pwpolicy says cannot authenticate goes straight to
-// recreation without ever calling the helper (laps_token.sh already ran the soft repairs).
+// The pwpolicy gate: a token holder that pwpolicy says cannot authenticate goes straight to recreation without ever calling the helper (laps_token.sh already ran the soft repairs).
 func TestEnsureUserRecreatesWhenPwpolicyBlocksAuthentication(t *testing.T) {
 	osState := &fakeOS{exists: map[string]bool{"lapsadmin": true}, token: map[string]bool{"lapsadmin": true}}
 
@@ -426,6 +414,49 @@ func TestEnsureUserRecreatesWhenPwpolicyBlocksAuthentication(t *testing.T) {
 	}
 	if f.count("/usr/local/bin/mac_helper") != 0 {
 		t.Fatal("the helper must not be asked to rotate an account pwpolicy already declared blocked")
+	}
+}
+
+// The gate must match only a real verdict, never a pwpolicy error: "Error: user <x> not found"-style outputs carry "not", and a loose "not"+"allowed" match would heal a healthy admin over an error message; errors and unrecognised output fall through to rotation.
+func TestEnsureUserPwpolicyGateIgnoresErrorOutput(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		out    string
+		outErr error
+	}{
+		{name: "error text carrying both not and allowed", out: "Error: command not allowed against the directory service", outErr: fmt.Errorf("exit 1")},
+		{name: "healthy verdict", out: "Policy allows user lapsadmin to authenticate", outErr: nil},
+		{name: "no output at all", out: "", outErr: fmt.Errorf("signal: killed")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			osState := &fakeOS{exists: map[string]bool{"lapsadmin": true}, token: map[string]bool{"lapsadmin": true}}
+
+			f := &fakeRunner{}
+			f.handle = func(c call) ([]byte, error) {
+				if out, err, ok := osState.handleCommon(c); ok {
+					return out, err
+				}
+				switch {
+				case c.is("pwpolicy", "-u", "lapsadmin", "authentication-allowed"):
+					return []byte(tt.out), tt.outErr
+				case c.name == "/usr/local/bin/mac_helper":
+					return []byte("[SWIFT] change ok"), nil
+				}
+				t.Fatalf("unexpected command: %s", c)
+				return nil, nil
+			}
+
+			m := newTestManager(f)
+			if err := m.EnsureUserAndChangePassword(context.Background(), "lapsadmin", "old-pass", "", "new-pass"); err != nil {
+				t.Fatalf("rotation failed: %v", err)
+			}
+			if f.count("sysadminctl -deleteUser lapsadmin") != 0 {
+				t.Fatal("a pwpolicy error/healthy output must never trigger account recreation")
+			}
+			if f.count("/usr/local/bin/mac_helper") == 0 {
+				t.Fatal("rotation must proceed through the helper when the gate does not fire")
+			}
+		})
 	}
 }
 

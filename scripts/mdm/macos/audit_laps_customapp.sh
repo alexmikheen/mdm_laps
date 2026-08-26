@@ -25,8 +25,7 @@ log_message() {
 
 log_message "Starting local Audit for LAPS Updater..."
 
-# 1. The macOS receipt database is the authority on what is installed.
-# The on-disk file check comes AFTER it, deliberately: when a missing file was tested first, a wrong BINARY_PATH made the audit unsatisfiable, and the MDM answered every failure by reinstalling a package that was already installed correctly — forever, while reporting PASS because the install itself kept succeeding. awk '{print $2}' extracts just the version number from "version: 1.0"
+# 1. The macOS receipt database is the authority on what is installed. The on-disk file check comes AFTER it, deliberately: when a missing file was tested first, a wrong BINARY_PATH made the audit unsatisfiable, and the MDM answered every failure by reinstalling a package that was already installed correctly — forever, while reporting PASS because the install itself kept succeeding. awk '{print $2}' extracts just the version number from "version: 1.0"
 INSTALLED_VERSION=$(pkgutil --pkg-info "$PKG_ID" 2>/dev/null | grep -i "^version: " | awk '{print $2}')
 
 if [ -z "$INSTALLED_VERSION" ]; then

@@ -93,8 +93,7 @@ func RunLAPS(ctx context.Context, cfg *config.Config, osMgr osmgmt.Manager, vaul
 		return vaultFailure(fmt.Errorf("failed to save to Vault: %w", err))
 	}
 
-	// The vault write above deliberately happens first: the rotated password must be recorded even when the token grant failed, otherwise the device becomes unreachable. But the run itself is NOT a success — without a Secure Token the account cannot unlock FileVault, and exiting 0 here is what made the MDM report "Pass" for devices left with no working recovery account.
-	// The one exception: the rotation succeeded, the password is escrowed, and the failed token grant already retried its prompt — with a local PRK and an escrowed bootstrap token the device is degraded, not broken, so it reports a warning instead of sitting permanently red while the grant keeps retrying every check-in.
+	// The vault write above deliberately happens first: the rotated password must be recorded even when the token grant failed, otherwise the device becomes unreachable. But the run itself is NOT a success — without a Secure Token the account cannot unlock FileVault, and exiting 0 here is what made the MDM report "Pass" for devices left with no working recovery account. The one exception: the rotation succeeded, the password is escrowed, and the failed token grant already retried its prompt — with a local PRK and an escrowed bootstrap token the device is degraded, not broken, so it reports a warning instead of sitting permanently red while the grant keeps retrying every check-in.
 	if tokenStatus == osmgmt.TokenStatusDisabledCovered {
 		log.Printf("[WARNING] %s finishes without a Secure Token; reported as a covered degradation (a personal recovery key exists locally and the bootstrap token is escrowed). The grant retries on the next check-in.\n", cfg.AdminUser)
 		return nil

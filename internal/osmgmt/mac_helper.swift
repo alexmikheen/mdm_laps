@@ -17,9 +17,7 @@ func readStdin() -> LapsPayload? {
     return try? JSONDecoder().decode(LapsPayload.self, from: data)
 }
 
-// ==============================================================================
-// 1. ADMINISTRATIVE RESET
-// ==============================================================================
+// ============================================================================== 1. ADMINISTRATIVE RESET ==============================================================================
 
 // ResetOutcome separates "sysadminctl performed the reset" from "sysadminctl exited 0 while opendirectoryd refused it" — the phantom that escrowed passwords the machine never received (observed in production).
 enum ResetOutcome {
@@ -66,9 +64,7 @@ func administrativeResetSecure(user: String, newPass: String) -> ResetOutcome {
     } catch { return .failed }
 }
 
-// ==============================================================================
-// 2. NATIVE OPENDIRECTORY ROTATION
-// ==============================================================================
+// ============================================================================== 2. NATIVE OPENDIRECTORY ROTATION ==============================================================================
 
 // localUserRecord looks up a local account in OpenDirectory.
 func localUserRecord(user: String) throws -> ODRecord? {
@@ -185,9 +181,7 @@ func changePasswordNative(user: String, oldPass: String?, newPass: String, allow
     }
 }
 
-// ==============================================================================
-// 3. SECURE TOKEN GRANT
-// ==============================================================================
+// ============================================================================== 3. SECURE TOKEN GRANT ==============================================================================
 
 // stdin only, no argv fallback — same fleet evidence as the administrative reset above.
 func grantSecureTokenSecure(targetUser: String, targetPass: String, adminUser: String, adminPass: String) -> Bool {
@@ -211,8 +205,7 @@ func grantSecureTokenSecure(targetUser: String, targetPass: String, adminUser: S
     } catch { return false }
 }
 
-// secureTokenIsEnabled asks macOS for the real token state.
-// This exists because `sysadminctl` exits 0 even when opendirectoryd refused the operation outright — observed in the unified log as "Failed to enable SEP credential: Credential is not an admin" / ODErrorCredentialsNotAuthorized (error 5101) beside a process that still returned status 0. Trusting the exit code therefore reported a phantom success.
+// secureTokenIsEnabled asks macOS for the real token state. This exists because `sysadminctl` exits 0 even when opendirectoryd refused the operation outright — observed in the unified log as "Failed to enable SEP credential: Credential is not an admin" / ODErrorCredentialsNotAuthorized (error 5101) beside a process that still returned status 0. Trusting the exit code therefore reported a phantom success.
 func secureTokenIsEnabled(user: String) -> Bool {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/sbin/sysadminctl")
@@ -244,9 +237,7 @@ func grantSecureToken(targetUser: String, targetPass: String, adminUser: String,
     return false
 }
 
-// ==============================================================================
-// MAIN EXECUTION
-// ==============================================================================
+// ============================================================================== MAIN EXECUTION ==============================================================================
 
 guard let payload = readStdin() else {
     fputs("[SWIFT] Invalid JSON payload received from standard input.\n", stderr)

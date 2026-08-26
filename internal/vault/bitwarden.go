@@ -146,8 +146,7 @@ func (bw *BWClient) getItem(ctx context.Context, itemID string) (*BWItem, error)
 	return &item, nil
 }
 
-// putItem writes an item: PUT when it has an ID, POST to create otherwise.
-// Returns the item ID the server reports (needed after a create).
+// putItem writes an item: PUT when it has an ID, POST to create otherwise. Returns the item ID the server reports (needed after a create).
 func (bw *BWClient) putItem(ctx context.Context, item *BWItem) (string, error) {
 	itemJSON, err := json.Marshal(item)
 	if err != nil {
@@ -346,8 +345,7 @@ func (bw *BWClient) UpsertCredentials(ctx context.Context, creds *Credentials, d
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	// The rebuilt field list intentionally carries no pending_password:
-	// committing the real password IS the confirming write.
+	// The rebuilt field list intentionally carries no pending_password: committing the real password IS the confirming write.
 	item := &BWItem{
 		ID:   creds.ItemID,
 		Name: deviceID,

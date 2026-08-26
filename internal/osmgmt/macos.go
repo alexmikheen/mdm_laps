@@ -230,11 +230,10 @@ func (m *MacOSManager) userAccountExists(ctx context.Context, user string) (bool
 	return false, fmt.Errorf("could not run id -u %s: %w", user, err)
 }
 
-// EnsureUserAndChangePassword manages account existence and triggers native password rotation.
-// IMPLEMENTS AGGRESSIVE AUTO-HEALING: If the user exists but lacks a token, it deletes the user to reset the SEP crypto-chain.
+// EnsureUserAndChangePassword manages account existence and triggers native password rotation. IMPLEMENTS AGGRESSIVE AUTO-HEALING: If the user exists but lacks a token, it deletes the user to reset the SEP crypto-chain.
 func (m *MacOSManager) EnsureUserAndChangePassword(ctx context.Context, user, oldPassword, altOldPass, newPassword string) error {
-	// Account creation/deletion talks to opendirectoryd and can be slow; the run deadline still caps it.
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	// 5 minutes, not 2: the worst path stacks two 60s-capped helper calls on top of the heal ladder (delete, bridge, recreate, cache resets, sleeps), and a deadline expiring between the delete and the recreate leaves the device without its admin until the next check-in; the run budget still caps everything above.
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
 	// 1. Check if user exists
@@ -261,8 +260,12 @@ func (m *MacOSManager) EnsureUserAndChangePassword(ctx context.Context, user, ol
 	}
 
 	// 4. Token holder, but OpenDirectory refuses to let it authenticate ("until password is changed"). Production forensics exhausted every soft repair — counter clear, legacy/per-user policy clears, MDM UnlockUserAccount, opendirectoryd restart, multiple reboots — the state is persistent on-disk/KDC, so recreation is the only cure. laps_token.sh runs those soft repairs before this binary, so reaching here blocked means they already failed.
-	out, _ := m.run.Run(ctx, "", "pwpolicy", "-u", user, "authentication-allowed")
-	if verdict := strings.TrimSpace(string(out)); strings.Contains(verdict, "not") && strings.Contains(verdict, "allowed") {
+	// Anchored on "allowed to authenticate": covers both Apple phrasings (incl. "is not be allowed to authenticate until password is changed") while no known pwpolicy ERROR output contains it — a bare "not"+"allowed" match could heal a healthy admin over an error message. Exit code is informational (undocumented for blocked accounts); only a no-output failure skips the gate, and the rotation below still verifies the real state.
+	out, pwErr := m.run.Run(ctx, "", "pwpolicy", "-u", user, "authentication-allowed")
+	verdict := strings.TrimSpace(string(out))
+	if pwErr != nil && verdict == "" {
+		log.Printf("[WARNING] pwpolicy gave no authentication-allowed verdict for %s (%v) — skipping the gate this run.\n", user, pwErr)
+	} else if strings.Contains(verdict, "not") && strings.Contains(verdict, "allowed to authenticate") {
 		log.Printf("[WARNING] %s holds a Secure Token but cannot authenticate (%s). Escalating to account recreation — the token grant afterwards may prompt the console user via Admin By Request.\n", user, verdict)
 		return m.healAccount(ctx, user, newPassword)
 	}
@@ -617,8 +620,7 @@ func parseSecureTokenStatus(output string) (enabled, ok bool) {
 	return false, false
 }
 
-// secureTokenState reports whether user holds a Secure Token.
-// A returned error means macOS did not answer (timeout, hung opendirectoryd, unknown account, unrecognised output) — it does NOT mean the account has no token, and callers must not treat it as such. Reporting a failed check as "no token" is what made a transient sysadminctl failure delete a healthy admin account.
+// secureTokenState reports whether user holds a Secure Token. A returned error means macOS did not answer (timeout, hung opendirectoryd, unknown account, unrecognised output) — it does NOT mean the account has no token, and callers must not treat it as such. Reporting a failed check as "no token" is what made a transient sysadminctl failure delete a healthy admin account.
 func (m *MacOSManager) secureTokenState(ctx context.Context, user string) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -671,8 +673,7 @@ func (m *MacOSManager) verifyUserPassword(ctx context.Context, user, pass string
 	return true
 }
 
-// getTokenHolders returns every local account that actually holds a Secure Token.
-// It deliberately no longer uses `fdesetup list`: that reports FileVault-*enabled* users, which is a different set. On a Mac where FileVault has not finished enabling, real token holders are missing from it, the list comes back empty, and the old code then fell back to a hardcoded legacy admin — the very account laps_token.sh deletes once the target admin is healthy. The silent grant path then had no credential it could possibly use.
+// getTokenHolders returns every local account that actually holds a Secure Token. It deliberately no longer uses `fdesetup list`: that reports FileVault-*enabled* users, which is a different set. On a Mac where FileVault has not finished enabling, real token holders are missing from it, the list comes back empty, and the old code then fell back to a hardcoded legacy admin — the very account laps_token.sh deletes once the target admin is healthy. The silent grant path then had no credential it could possibly use.
 func (m *MacOSManager) getTokenHolders(ctx context.Context) []string {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
@@ -704,8 +705,7 @@ func (m *MacOSManager) getTokenHolders(ctx context.Context) []string {
 	return holders
 }
 
-// parseLocalUsers extracts real (non-system) account names from `dscl . -list /Users UniqueID`.
-// Accounts with UID < 500 are skipped so we don't spawn ~100 sysadminctl calls on system users.
+// parseLocalUsers extracts real (non-system) account names from `dscl . -list /Users UniqueID`. Accounts with UID < 500 are skipped so we don't spawn ~100 sysadminctl calls on system users.
 func parseLocalUsers(dsclOutput string) []string {
 	var users []string
 	for _, line := range strings.Split(dsclOutput, "\n") {
@@ -843,12 +843,7 @@ func (m *MacOSManager) promptUserForToken(ctx context.Context, targetUser, targe
 	return false
 }
 
-// openURLAsUser opens a URL in the console user's GUI session, as that user.
-// BOTH parts are required, and each one alone is broken:
-//   - `launchctl asuser <uid>` puts the process in the user's Aqua/bootstrap session, which `open` needs to have a GUI session to hand the URL to — but it does NOT change the uid. The process stays root, so LaunchServices resolves the default browser from *root's* preferences, where none is set, and silently falls back to Safari. Observed in production: with asuser-only the URL opened in Safari with no logged-in session instead of the user's actual default browser.
-//   - `sudo -u <user>` alone drops to the user (so LaunchServices reads their default-browser preference and the browser starts with their profile and cookies) but does not enter the Aqua session.
-//
-// Combined, the URL lands in the user's real default browser with their existing session, so a help link resolves without a second sign-in. Running sudo from root needs no password, and Admin By Request's per-session sudo gating applies to non-root callers, not to us.
+// openURLAsUser opens a URL in the console user's GUI session, as that user. BOTH parts are required, and each one alone is broken: - `launchctl asuser <uid>` puts the process in the user's Aqua/bootstrap session, which `open` needs to have a GUI session to hand the URL to — but it does NOT change the uid. The process stays root, so LaunchServices resolves the default browser from *root's* preferences, where none is set, and silently falls back to Safari. Observed in production: with asuser-only the URL opened in Safari with no logged-in session instead of the user's actual default browser. - `sudo -u <user>` alone drops to the user (so LaunchServices reads their default-browser preference and the browser starts with their profile and cookies) but does not enter the Aqua session. Combined, the URL lands in the user's real default browser with their existing session, so a help link resolves without a second sign-in. Running sudo from root needs no password, and Admin By Request's per-session sudo gating applies to non-root callers, not to us.
 func openURLAsUser(ctx context.Context, uid, user, url string) {
 	cmd := exec.CommandContext(ctx, "launchctl", "asuser", uid, "sudo", "-u", user, "open", url)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -872,8 +867,7 @@ func (m *MacOSManager) isAdminMember(ctx context.Context, user string) bool {
 	return err == nil && strings.Contains(string(out), "user is a member")
 }
 
-// ensureAdminViaAbR guides the console user into a temporary Admin By Request session and waits until their admin rights actually appear. Returns true once the user is an admin.
-// This exists because the GUI grant path is otherwise a dead end on AbR-managed Macs: the user's password is correct, but without admin membership opendirectoryd refuses the grant, and the user only saw a generic "unexpected system error". The observed manual fix was an IT person telling them to request AbR access and try again — this automates that.
+// ensureAdminViaAbR guides the console user into a temporary Admin By Request session and waits until their admin rights actually appear. Returns true once the user is an admin. This exists because the GUI grant path is otherwise a dead end on AbR-managed Macs: the user's password is correct, but without admin membership opendirectoryd refuses the grant, and the user only saw a generic "unexpected system error". The observed manual fix was an IT person telling them to request AbR access and try again — this automates that.
 func (m *MacOSManager) ensureAdminViaAbR(ctx context.Context, uid, user string) bool {
 	if _, err := os.Stat(abrAppPath); err != nil {
 		log.Printf("[WARNING] %s is not an administrator and Admin By Request is not installed — the token grant cannot succeed on this Mac.\n", user)
@@ -1039,8 +1033,7 @@ func (m *MacOSManager) DeleteServiceAccountToken(ctx context.Context) error {
 	if err == nil {
 		return nil
 	}
-	// Nothing to shred is the expected outcome of a manual run that took the token from the
-	// environment instead of the keychain — not worth alarming an operator over.
+	// Nothing to shred is the expected outcome of a manual run that took the token from the environment instead of the keychain — not worth alarming an operator over.
 	if strings.Contains(string(out), "could not be found") {
 		log.Println("[INFO] No token was present in the Keychain; nothing to shred.")
 		return nil

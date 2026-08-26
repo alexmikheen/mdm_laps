@@ -36,8 +36,7 @@ func TestPickNewestMatch(t *testing.T) {
 			serial: "SERIAL1", wantID: "a", wantMatches: 1,
 		},
 		{
-			// Observed in production: a single serial can accumulate several items with
-			// different passwords. Taking the first match can hand back a months-old password.
+			// Observed in production: a single serial can accumulate several items with different passwords. Taking the first match can hand back a months-old password.
 			name: "duplicates: newest wins even when it is last",
 			items: []onepassword.ItemOverview{
 				overview("stale", "SERIAL1", day(1)),
@@ -87,8 +86,7 @@ func TestPickNewestMatch(t *testing.T) {
 	}
 }
 
-// A duplicate count above 1 is what triggers the operator warning, so it has to be the number of
-// items sharing the serial — not the total scanned, and not just "more than one exists".
+// A duplicate count above 1 is what triggers the operator warning, so it has to be the number of items sharing the serial — not the total scanned, and not just "more than one exists".
 func TestPickNewestMatchCountsOnlyMatchingItems(t *testing.T) {
 	items := []onepassword.ItemOverview{
 		overview("a", "SERIAL1", day(1)),
@@ -131,8 +129,7 @@ func TestSetFieldAppendsWhenAbsent(t *testing.T) {
 	}
 }
 
-// The staged password must be gone once the real password field carries it, otherwise every
-// record keeps a second, unmarked copy of a live credential.
+// The staged password must be gone once the real password field carries it, otherwise every record keeps a second, unmarked copy of a live credential.
 func TestRemoveFieldDropsOnlyTheNamedField(t *testing.T) {
 	fields := []onepassword.ItemField{
 		{ID: "field_login", Value: "lapsadmin"},

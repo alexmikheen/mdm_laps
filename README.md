@@ -30,21 +30,12 @@ Provider-specific variables are documented in [docs/configuration.md](docs/confi
 
 ## Architecture
 
-The rotation is built around one constraint: it is irreversible, and the vault holds the only copy
-of the result. The highlights:
+The rotation is built around one constraint: it is irreversible, and the vault holds the only copy of the result. The highlights:
 
-- **Escrow-first**: the new password is staged in the vault *before* the device is touched, and the
-  confirming write retires the staged copy. A run that dies mid-way is always recoverable.
-- **The helper reports, Go decides**: privileged macOS operations live in a small Swift helper that
-  returns a structured outcome (ok / od-error / auth-failed / locked / reset-refused /
-  policy-rejected), and phantom `sysadminctl` resets — exit 0 while opendirectoryd refuses — are
-  detected by output markers, never trusted by exit code.
-- **Secure Token discipline**: token holders are never administratively reset; an unusable account
-  is recreated through a heal ladder that bridges macOS's last-admin guard with a temporary admin.
-  A failed token grant is a failed run, softened to a warning only when MDM recovery
-  (a local personal recovery key + escrowed bootstrap token) covers the device.
-- **Fleet-scale vault writes**: retries with random jitter, read-modify-write inside the retry, and
-  a run budget that always reserves time for the final vault write.
+- **Escrow-first**: the new password is staged in the vault *before* the device is touched, and the confirming write retires the staged copy. A run that dies mid-way is always recoverable.
+- **The helper reports, Go decides**: privileged macOS operations live in a small Swift helper that returns a structured outcome (ok / od-error / auth-failed / locked / reset-refused / policy-rejected), and phantom `sysadminctl` resets — exit 0 while opendirectoryd refuses — are detected by output markers, never trusted by exit code.
+- **Secure Token discipline**: token holders are never administratively reset; an unusable account is recreated through a heal ladder that bridges macOS's last-admin guard with a temporary admin. A failed token grant is a failed run, softened to a warning only when MDM recovery (a local personal recovery key + escrowed bootstrap token) covers the device.
+- **Fleet-scale vault writes**: retries with random jitter, read-modify-write inside the retry, and a run budget that always reserves time for the final vault write.
 
 Details: [docs/architecture.md](docs/architecture.md) · GUI prompt on privilege-managed Macs:
 [docs/admin-by-request.md](docs/admin-by-request.md)

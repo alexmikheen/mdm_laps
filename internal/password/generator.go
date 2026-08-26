@@ -11,8 +11,7 @@ const (
 	lower  = "abcdefghijklmnopqrstuvwxyz"
 	upper  = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	digits = "0123456789"
-	// No quotes, backticks or backslashes: the generated password crosses AppleScript, shell
-	// wrappers and sysadminctl argument lists, and every one of those has its own quoting rules.
+	// No quotes, backticks or backslashes: the generated password crosses AppleScript, shell wrappers and sysadminctl argument lists, and every one of those has its own quoting rules.
 	symbols = "!@#$%^&*()-_=+[]{}|;:,.<>/?"
 
 	allChars = lower + upper + digits + symbols
@@ -23,20 +22,13 @@ const (
 	DefaultLength = 18
 )
 
-// Generate creates a cryptographically secure password of the specified length.
-// It loops until the generated password contains at least one lowercase letter,
-// one uppercase letter, and one digit to satisfy MDM complexity policies.
-//
-// An exhausted entropy source is returned as an error rather than ending the process:
-// this runs after the vault has been read and the caller owns the shutdown path (log flushing,
-// exit code), which a log.Fatal here used to bypass.
+// Generate creates a cryptographically secure password of the specified length. It loops until the generated password contains at least one lowercase letter, one uppercase letter, and one digit to satisfy MDM complexity policies. An exhausted entropy source is returned as an error rather than ending the process: this runs after the vault has been read and the caller owns the shutdown path (log flushing, exit code), which a log.Fatal here used to bypass.
 func Generate(length int) (string, error) {
 	if length < MinLength {
 		length = DefaultLength
 	}
 
-	// We use a loop to "generate and validate". It will keep generating new
-	// passwords in milliseconds until one perfectly matches the complexity rules.
+	// We use a loop to "generate and validate". It will keep generating new passwords in milliseconds until one perfectly matches the complexity rules.
 	for {
 		result := make([]byte, length)
 		hasLower := false
@@ -62,8 +54,7 @@ func Generate(length int) (string, error) {
 			}
 		}
 
-		// MDM Policy check: Must contain alphanumeric characters.
-		// We enforce at least 1 lower, 1 upper, and 1 digit to be bulletproof.
+		// MDM Policy check: Must contain alphanumeric characters. We enforce at least 1 lower, 1 upper, and 1 digit to be bulletproof.
 		if hasLower && hasUpper && hasDigit && !violatesAllowSimple(result) {
 			return string(result), nil
 		}

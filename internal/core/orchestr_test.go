@@ -12,8 +12,7 @@ import (
 	"golaps/internal/vault"
 )
 
-// recorder captures the order in which the orchestrator touched the device and the vault.
-// The ordering is the point: escrow must happen before the irreversible rotation.
+// recorder captures the order in which the orchestrator touched the device and the vault. The ordering is the point: escrow must happen before the irreversible rotation.
 type recorder struct {
 	calls []string
 }
@@ -119,8 +118,7 @@ func TestRunLAPSHappyPath(t *testing.T) {
 	}
 }
 
-// The rotation is irreversible and the vault holds the only copy of the result, so the escrow
-// must be written first. Reversing these two is what leaves a device with a password nobody has.
+// The rotation is irreversible and the vault holds the only copy of the result, so the escrow must be written first. Reversing these two is what leaves a device with a password nobody has.
 func TestRunLAPSEscrowsBeforeRotating(t *testing.T) {
 	rec := &recorder{}
 	mgr := &fakeManager{rec: rec}
@@ -182,9 +180,7 @@ func TestRunLAPSDoesNotSyncVaultWhenRotationFails(t *testing.T) {
 	}
 }
 
-// Without a Secure Token the account cannot unlock FileVault. The password must still be
-// escrowed (otherwise the device is unreachable), but the run has to end non-zero — reporting
-// success here is what made the MDM show "Pass" for devices left with no recovery account.
+// Without a Secure Token the account cannot unlock FileVault. The password must still be escrowed (otherwise the device is unreachable), but the run has to end non-zero — reporting success here is what made the MDM show "Pass" for devices left with no recovery account.
 func TestRunLAPSFailsButStillEscrowsWhenTokenGrantFails(t *testing.T) {
 	rec := &recorder{}
 	mgr := &fakeManager{rec: rec, tokenStatus: "DISABLED (Review Required)"}
@@ -221,8 +217,7 @@ func TestRunLAPSReportsVaultWriteFailure(t *testing.T) {
 	}
 }
 
-// A password staged by a run that died mid-rotation may already be the live one, so it is a
-// better reset candidate than the MDM fallback when nothing else is recorded.
+// A password staged by a run that died mid-rotation may already be the live one, so it is a better reset candidate than the MDM fallback when nothing else is recorded.
 func TestRunLAPSPrefersStagedPasswordWhenNoneRecorded(t *testing.T) {
 	rec := &recorder{}
 	var seenOldPass string

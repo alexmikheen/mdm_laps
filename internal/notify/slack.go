@@ -20,17 +20,17 @@ func NewSlackNotifier(webhookURL string) *SlackNotifier {
 }
 
 type SlackMessage struct {
-	Text        string         `json:"text"`
-	Attachments []Attachment   `json:"attachments,omitempty"`
+	Text        string       `json:"text"`
+	Attachments []Attachment `json:"attachments,omitempty"`
 }
 
 type Attachment struct {
-	Color      string  `json:"color"`
-	Title      string  `json:"title"`
-	Text       string  `json:"text"`
-	Fields     []Field `json:"fields,omitempty"`
-	Timestamp  int64   `json:"ts"`
-	Footer     string  `json:"footer"`
+	Color     string  `json:"color"`
+	Title     string  `json:"title"`
+	Text      string  `json:"text"`
+	Fields    []Field `json:"fields,omitempty"`
+	Timestamp int64   `json:"ts"`
+	Footer    string  `json:"footer"`
 }
 
 type Field struct {
@@ -53,7 +53,7 @@ func (s *SlackNotifier) SendPasswordRotation(hostname, serial, adminUser, status
 			{
 				Color: color,
 				Title: title,
-				Text: fmt.Sprintf("Device: %s\nSerial: %s\nAdmin: %s", hostname, serial, adminUser),
+				Text:  fmt.Sprintf("Device: %s\nSerial: %s\nAdmin: %s", hostname, serial, adminUser),
 				Fields: []Field{
 					{Title: "Hostname", Value: hostname, Short: true},
 					{Title: "Serial Number", Value: serial, Short: true},

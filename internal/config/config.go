@@ -101,10 +101,7 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-// getConfigValue resolves a setting env-first, then from the managed preference profile.
-// The source string in the return lets the caller say WHERE a value came from: a value that
-// merely EQUALS the default is otherwise indistinguishable from a missing profile, which
-// makes "config read failed" warnings fire on devices where the profile was fine all along.
+// getConfigValue resolves a setting env-first, then from the managed preference profile. The source string in the return lets the caller say WHERE a value came from: a value that merely EQUALS the default is otherwise indistinguishable from a missing profile, which makes "config read failed" warnings fire on devices where the profile was fine all along.
 func getConfigValue(ctx context.Context, key, envName, fallback string) (value, source string) {
 	if envName != "" {
 		if envVal := strings.TrimSpace(os.Getenv(envName)); envVal != "" {

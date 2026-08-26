@@ -8,10 +8,7 @@
 # Required Permissions: root
 # Safety Notes: Uses caffeinate to prevent sleep during API calls. Battery check prevents state desync.
 # ==============================================================================
-# Strict-ish mode. Deliberately NOT `set -e`: several checks below exit 0 on purpose (PKG not
-# downloaded yet, low battery) and a bare -e would turn every non-zero probe into an abort. What we
-# do want is an unset variable to be a hard error rather than an empty string silently standing in
-# for a secret, and a failing stage of a pipeline not to be masked by a later one.
+# Strict-ish mode. Deliberately NOT `set -e`: several checks below exit 0 on purpose (PKG not downloaded yet, low battery) and a bare -e would turn every non-zero probe into an abort. What we do want is an unset variable to be a hard error rather than an empty string silently standing in for a secret, and a failing stage of a pipeline not to be masked by a later one.
 set -uo pipefail
 
 # ==============================================================================
@@ -20,11 +17,9 @@ set -uo pipefail
 export LAPS_VAULT_TYPE="__VAULT_TYPE__"
 export LAPS_VAULT_TOKEN="__VAULT_SERVICE_TOKEN_OPTIONAL__"
 export LEGACY_ADMIN_PASS="__LEGACY_ADMIN_PASSWORD_OPTIONAL__"
-# Optional: a legacy admin account from a previous MDM/LAPS deployment that this script retires
-# once the managed admin holds a Secure Token. Leave the placeholder to skip that cleanup.
+# Optional: a legacy admin account from a previous MDM/LAPS deployment that this script retires once the managed admin holds a Secure Token. Leave the placeholder to skip that cleanup.
 LEGACY_ADMIN_ACCOUNT="__LEGACY_ADMIN_ACCOUNT_OPTIONAL__"
-# Optional: a URL whose reachability proves the vault API is reachable (the Wasm SDK panics on a
-# dead network). Leave the placeholder to use the provider default, set empty to skip the probe.
+# Optional: a URL whose reachability proves the vault API is reachable (the Wasm SDK panics on a dead network). Leave the placeholder to use the provider default, set empty to skip the probe.
 REACHABILITY_URL="__REACHABILITY_URL_OPTIONAL__"
 
 KEYCHAIN="/Library/Keychains/System.keychain"
@@ -35,8 +30,7 @@ BRIDGE_ADMIN="laps-bridge"
 LOG_FILE="/Library/Logs/golaps.log"
 
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
-# Probe writability once rather than redirecting blindly, so a non-root manual run does not spray
-# "permission denied" into the MDM log.
+# Probe writability once rather than redirecting blindly, so a non-root manual run does not spray "permission denied" into the MDM log.
 LOG_OK=0
 if : >> "$LOG_FILE" 2>/dev/null; then
     LOG_OK=1
@@ -120,9 +114,7 @@ if [ -z "$TARGET_ADMIN" ]; then
 fi
 
 # --- 2.5 SERVICE-ACCOUNT AUTH GATE + REPAIR ---
-# Clears the failed-login counter, asks OD for the auth verdict, repairs the known change-required
-# blockers, and GATES the rotation on the result: a still-blocked account would only feed the
-# phantom administrative reset and commit one more wrong password to the vault.
+# Clears the failed-login counter, asks OD for the auth verdict, repairs the known change-required blockers, and GATES the rotation on the result: a still-blocked account would only feed the phantom administrative reset and commit one more wrong password to the vault.
 if [ -n "$TARGET_ADMIN" ] && id "$TARGET_ADMIN" >/dev/null 2>&1; then
     FAILED_COUNT=$(dscl . -read "/Users/$TARGET_ADMIN" accountPolicyData 2>/dev/null | grep -A1 failedLoginCount | grep -oE '[0-9]+' | head -n 1)
     if [ -n "$FAILED_COUNT" ] && [ "$FAILED_COUNT" -gt 0 ]; then
@@ -132,9 +124,7 @@ if [ -n "$TARGET_ADMIN" ] && id "$TARGET_ADMIN" >/dev/null 2>&1; then
     dscl . -deletepl "/Users/$TARGET_ADMIN" accountPolicyData failedLoginCount 2>/dev/null || true
     dscl . -deletepl "/Users/$TARGET_ADMIN" accountPolicyData failedLoginTimestamp 2>/dev/null || true
 
-    # Re-assert admin membership every run: privilege-management tools (e.g. Admin By Request)
-    # demote admins that are not in their exclusion list, and a demoted service admin rotates
-    # green while being useless for recovery.
+    # Re-assert admin membership every run: privilege-management tools (e.g. Admin By Request) demote admins that are not in their exclusion list, and a demoted service admin rotates green while being useless for recovery.
     if ! dseditgroup -o checkmember -m "$TARGET_ADMIN" admin >/dev/null 2>&1; then
         log "[WARNING] $TARGET_ADMIN is not in the admin group (privilege-management cleanup?) — re-adding. Recurring on this device means $TARGET_ADMIN must go into the tool's exclusion list (e.g. AbR ExcludedAccounts)."
         dseditgroup -o edit -a "$TARGET_ADMIN" -t user admin 2>/dev/null || log "[ERROR] Could not re-add $TARGET_ADMIN to the admin group."
@@ -168,10 +158,7 @@ if [ -n "$TARGET_ADMIN" ] && id "$TARGET_ADMIN" >/dev/null 2>&1; then
     fi
 
     if [[ "$VERDICT" == *"not"*"allowed"* ]]; then
-        # Ask the binary what it can do instead of comparing version numbers: a hardcoded version
-        # gate is wrong exactly once, and that once hands devices over to a binary that can only
-        # phantom-reset and poison the vault. A binary without the flag prints nothing / exits
-        # non-zero, which reads as "cannot" — the safe direction.
+        # Ask the binary what it can do instead of comparing version numbers: a hardcoded version gate is wrong exactly once, and that once hands devices over to a binary that can only phantom-reset and poison the vault. A binary without the flag prints nothing / exits non-zero, which reads as "cannot" — the safe direction.
         CAPS=$("$LAPS_BINARY" --capabilities 2>/dev/null || true)
         if [[ "$CAPS" == *"recreate-locked"* ]]; then
             log "[WARNING] $TARGET_ADMIN is still blocked after every soft repair — handing over to golaps for account recreation (capabilities: $CAPS). The console user may get a GUI token prompt."
@@ -203,21 +190,11 @@ if [ -n "$REACHABILITY_URL" ]; then
     fi
 fi
 
-# --- 3. TOKEN PROVISIONING (SYSTEM KEYCHAIN) ---
+# --- 3. TOKEN HAND-OFF ---
+# Environment only: the binary reads env FIRST and runs as a direct child, so a keychain copy is redundant — and `security add-generic-password -w "$TOKEN"` puts the secret in argv (world-readable via ps) with no stdin alternative when a keychain path is given. The binary's keychain READ fallback stays for manually pre-provisioned items; cleanup and the startup shred keep deleting leftovers.
 if [ -n "${LAPS_VAULT_TOKEN:-}" ]; then
-    log "[INFO] Injecting the vault token into the System Keychain..."
+    log "[INFO] Handing the vault token to golaps via the environment (no keychain copy)."
     security delete-generic-password -l "$KEYCHAIN_LABEL" "$KEYCHAIN" >/dev/null 2>&1
-    # -A (any application) looks broad, but the ACL is not the control here and -T would be worse:
-    # golaps reads this item by shelling out to /usr/bin/security, so a -T /usr/local/bin/golaps ACL
-    # would lock out the very process that needs it, while -T /usr/bin/security restricts nothing.
-    # The real boundary is the System keychain itself, which is gated on root via /var/db/SystemKey.
-    # The item is removed again on exit and by golaps at startup.
-    if ! security add-generic-password -a "ServiceAccount" -l "$KEYCHAIN_LABEL" -s "GoLAPSVaultToken" -w "$LAPS_VAULT_TOKEN" -A "$KEYCHAIN"; then
-        # Unchecked, this failure surfaced much later and much more confusingly, as "token not found" from the binary's config loader.
-        log "[ERROR] Could not store the vault token in the System Keychain."
-        exit 1
-    fi
-    log "[SUCCESS] Token secured in System Keychain."
 else
     log "[INFO] Vault token not provided in this script. The binary will use provider-specific environment/configuration."
 fi
@@ -230,9 +207,7 @@ log "[INFO] Starting LAPS rotation process..."
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -ne 0 ]; then
-    # golaps also exits non-zero when the rotation succeeded but the target admin still holds no
-    # Secure Token — the device has no FileVault recovery account and this run must show up red
-    # in the MDM console, not as Pass.
+    # golaps also exits non-zero when the rotation succeeded but the target admin still holds no Secure Token — the device has no FileVault recovery account and this run must show up red in the MDM console, not as Pass.
     log "[ERROR] LAPS binary failed with exit code $EXIT_CODE."
     log "[INFO] Keeping any legacy/bridge admin as crypto-recovery fallback; skipping cleanup."
     exit 1
@@ -241,9 +216,7 @@ fi
 log "[SUCCESS] LAPS rotation completed successfully."
 
 # --- 5. POST-ROTATION SECURITY CLEANUP (LEGACY/BRIDGE ADMIN) ---
-# Retires the configured legacy admin (from a previous deployment) and the temporary bridge admin
-# that golaps creates to satisfy macOS's last-admin guard — but only once the managed admin is
-# fully functional WITH a Secure Token, because until then they are the only crypto-recovery path.
+# Retires the configured legacy admin (from a previous deployment) and the temporary bridge admin that golaps creates to satisfy macOS's last-admin guard — but only once the managed admin is fully functional WITH a Secure Token, because until then they are the only crypto-recovery path.
 retire_account() {
     local account="$1"
     if [ -z "$account" ] || ! id "$account" &>/dev/null; then
@@ -254,14 +227,17 @@ retire_account() {
         return 0
     fi
     TOKEN_STATUS=$(sysadminctl -secureTokenStatus "$TARGET_ADMIN" 2>&1)
-    # Match the whole phrase: a bare "ENABLED" test is one typo from matching "DISABLED", which
-    # would delete the only crypto-recovery account we still have.
+    # Match the whole phrase: a bare "ENABLED" test is one typo from matching "DISABLED", which would delete the only crypto-recovery account we still have.
     if [[ "$TOKEN_STATUS" == *"is ENABLED"* ]] || [[ "$TOKEN_STATUS" == *"is ON"* ]]; then
         log "[WARNING] Account '$account' found. Target admin '$TARGET_ADMIN' is fully functional with Secure Token."
         log "[SECURITY] Deleting '$account' to reduce attack surface..."
+        # sysadminctl ONLY — a raw `dscl . -delete` bypasses the last-admin guard and orphans the SEP identity, leaving a tombstone that makes every later `sysadminctl -addUser` for the same name exit 0 without creating anything; the binary reuses the bridge name during heals. Delete the supported way, verify, and leave a survivor for the next run.
         sysadminctl -deleteUser "$account" >/dev/null 2>&1
-        dscl . -delete "/Users/$account" >/dev/null 2>&1
-        log "[SUCCESS] '$account' successfully removed from the system."
+        if id "$account" &>/dev/null; then
+            log "[WARNING] sysadminctl could not delete '$account' this run (last-admin guard or opendirectoryd hiccup). Leaving it for the next check-in — do NOT force-delete via dscl."
+        else
+            log "[SUCCESS] '$account' successfully removed from the system."
+        fi
     else
         log "[INFO] Target admin '$TARGET_ADMIN' does not have a Secure Token yet. Keeping '$account' as a fallback for crypto-recovery."
     fi

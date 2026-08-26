@@ -126,8 +126,7 @@ func (awsClient *AWSClient) GetCredentials(ctx context.Context, deviceID, vaultI
 	return res, nil
 }
 
-// StagePendingPassword escrows the candidate password before the device is touched.
-// Read-modify-write so the existing record (current password, legacy data) survives the stage.
+// StagePendingPassword escrows the candidate password before the device is touched. Read-modify-write so the existing record (current password, legacy data) survives the stage.
 func (awsClient *AWSClient) StagePendingPassword(ctx context.Context, creds *Credentials, deviceID, hostname, vaultID, newLogin, newPassword string) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -173,8 +172,7 @@ func (awsClient *AWSClient) UpsertCredentials(ctx context.Context, creds *Creden
 
 	secretName := fmt.Sprintf("laps/%s", deviceID)
 
-	// Prepare secret data. The rebuilt map intentionally carries no
-	// pending_password: committing the real password IS the confirming write.
+	// Prepare secret data. The rebuilt map intentionally carries no pending_password: committing the real password IS the confirming write.
 	secretData := map[string]string{
 		"hostname":     hostname,
 		"serial":       deviceID,

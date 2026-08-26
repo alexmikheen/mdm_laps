@@ -57,7 +57,7 @@ Status: %s
 	m.SetBody("text/plain", body)
 
 	d := mail.NewDialer(e.smtpHost, e.smtpPort, e.username, e.password)
-	
+
 	if err := d.DialAndSend(m); err != nil {
 		return fmt.Errorf("failed to send email: %w", err)
 	}

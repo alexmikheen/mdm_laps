@@ -33,8 +33,7 @@ func NewAzureClient(tenantID, clientID, clientSecret, vaultURL string) (*AzureCl
 
 	// Test connection
 	_, err = client.GetSecret(ctx, "health-check", "", nil)
-	// We expect an error for non-existent secret, but connection should work
-	// Just verify we can make calls
+	// We expect an error for non-existent secret, but connection should work Just verify we can make calls
 
 	return &AzureClient{
 		client: client,
@@ -117,8 +116,7 @@ func (ac *AzureClient) GetCredentials(ctx context.Context, deviceID, vaultID, ta
 	return res, nil
 }
 
-// StagePendingPassword escrows the candidate password before the device is touched.
-// Read-modify-write so the existing record (current password, legacy data) survives the stage.
+// StagePendingPassword escrows the candidate password before the device is touched. Read-modify-write so the existing record (current password, legacy data) survives the stage.
 func (ac *AzureClient) StagePendingPassword(ctx context.Context, creds *Credentials, deviceID, hostname, vaultID, newLogin, newPassword string) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -164,8 +162,7 @@ func (ac *AzureClient) UpsertCredentials(ctx context.Context, creds *Credentials
 
 	secretName := fmt.Sprintf("laps-%s", deviceID)
 
-	// Prepare secret data. The rebuilt map intentionally carries no
-	// pending_password: committing the real password IS the confirming write.
+	// Prepare secret data. The rebuilt map intentionally carries no pending_password: committing the real password IS the confirming write.
 	secretData := map[string]string{
 		"hostname":     hostname,
 		"serial":       deviceID,
