@@ -65,3 +65,7 @@ From GitHub, open **Actions -> Build GoLAPS -> Run workflow**. The workflow uplo
 - Use placeholders in committed scripts and profiles.
 - Rotate any credential that was ever committed before publishing.
 - If old commits contain internal company names, admin usernames, vault IDs, tokens, or internal URLs, publish from a fresh clean repository or rewrite Git history first.
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 — see the [LICENSE](LICENSE) file for details.
