@@ -14,6 +14,7 @@ const resultMarker = "LAPS_RESULT=OK"
 
 const ensureAccountScript = `
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
 $target = $env:LAPS_TARGET_USER
 $plain  = [Console]::In.ReadLine()
@@ -41,7 +42,7 @@ if (-not $account.Enabled) {
 $isMember = $false
 try {
     foreach ($m in Get-LocalGroupMember -SID 'S-1-5-32-544') {
-        if ($m.SID -eq $account.SID) { $isMember = $true; break }
+        if ($m.SID.Value -eq $account.SID.Value) { $isMember = $true; break }
     }
 } catch {
     Write-Output "ADMIN_CHECK_FAILED: $($_.Exception.Message)"
@@ -51,7 +52,7 @@ if ($isMember) {
     Write-Output 'ALREADY_ADMIN'
 } else {
     try {
-        Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $account.SID
+        Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $account
         Write-Output 'ADMIN_GRANTED'
     } catch [Microsoft.PowerShell.Commands.MemberExistsException] {
         Write-Output 'ALREADY_ADMIN'
@@ -63,6 +64,7 @@ Write-Output 'LAPS_RESULT=OK'
 
 const serialScript = `
 $ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
 $placeholders = @(
     'unknown', 'to be filled by o.e.m.', 'default string', '0',
     'system serial number', 'chassis serial number', 'board serial number',

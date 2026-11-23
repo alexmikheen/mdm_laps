@@ -79,6 +79,15 @@ func TestEnsureAccountScriptReadsThePasswordFromStdin(t *testing.T) {
 	if !strings.HasSuffix(trimmed, "Write-Output '"+resultMarker+"'") {
 		t.Fatal("the result marker is not the last statement of the script")
 	}
+	if strings.Contains(ensureAccountScript, "-Member $account.SID") {
+		t.Fatal("Add-LocalGroupMember -Member rejects SecurityIdentifier objects; pass $account instead")
+	}
+	if !strings.Contains(ensureAccountScript, "Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $account") {
+		t.Fatal("the script must pass the LocalUser object $account to Add-LocalGroupMember")
+	}
+	if !strings.Contains(ensureAccountScript, "$ProgressPreference = 'SilentlyContinue'") || !strings.Contains(serialScript, "$ProgressPreference = 'SilentlyContinue'") {
+		t.Fatal("PowerShell scripts must suppress CLIXML progress output on stderr")
+	}
 }
 
 func TestScriptReportsSuccessNeedsTheExactMarkerLine(t *testing.T) {

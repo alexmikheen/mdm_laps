@@ -1,5 +1,8 @@
 name: Windows E2E Test
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
   push:
@@ -44,8 +47,16 @@ jobs:
           $ErrorActionPreference = 'Stop'
 
           $vaultVersion = "1.18.4"
-          $zipPath = "$env:TEMP\vault.zip"
-          Invoke-WebRequest -Uri "https://releases.hashicorp.com/vault/${vaultVersion}/vault_${vaultVersion}_windows_amd64.zip" -OutFile $zipPath
+          $zipName = "vault_${vaultVersion}_windows_amd64.zip"
+          $zipPath = "$env:TEMP\$zipName"
+          $sumsPath = "$env:TEMP\vault_SHA256SUMS"
+          Invoke-WebRequest -Uri "https://releases.hashicorp.com/vault/${vaultVersion}/${zipName}" -OutFile $zipPath
+          Invoke-WebRequest -Uri "https://releases.hashicorp.com/vault/${vaultVersion}/vault_${vaultVersion}_SHA256SUMS" -OutFile $sumsPath
+          $expectedHash = ((Get-Content $sumsPath | Where-Object { $_ -match "\s+$zipName$" }) -split '\s+')[0].ToLowerInvariant()
+          $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ([string]::IsNullOrWhiteSpace($expectedHash) -or $actualHash -ne $expectedHash) {
+            throw "Vault SHA-256 mismatch: expected $expectedHash, got $actualHash"
+          }
           Expand-Archive -Path $zipPath -DestinationPath "$env:TEMP\vault-bin" -Force
           $vaultProc = Start-Process -FilePath "$env:TEMP\vault-bin\vault.exe" `
             -ArgumentList "server", "-dev", "-dev-root-token-id=golaps-e2e-token", "-dev-listen-address=127.0.0.1:18200" `
@@ -83,13 +94,13 @@ jobs:
             $u = Get-LocalUser -Name "GoLAPSAdmin"
             if (-not $u.Enabled) { throw "GoLAPSAdmin is not enabled" }
             $admins = Get-LocalGroupMember -SID 'S-1-5-32-544'
-            if (-not ($admins | Where-Object { $_.SID -eq $u.SID })) {
+            if (-not ($admins | Where-Object { $_.SID.Value -eq $u.SID.Value })) {
               throw "GoLAPSAdmin is not in Administrators (S-1-5-32-544)"
             }
 
             # Read serial and verify Vault record.
             $headers = @{ "X-Vault-Token" = "golaps-e2e-token" }
-            $list = Invoke-RestMethod -Method List -Uri "http://127.0.0.1:18200/v1/secret/metadata/laps" -Headers $headers
+            $list = Invoke-RestMethod -Uri "http://127.0.0.1:18200/v1/secret/metadata/laps?list=true" -Headers $headers
             $serial = $list.data.keys[0]
             Write-Host "Escrowed device serial: $serial"
 

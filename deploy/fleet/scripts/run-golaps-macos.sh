@@ -72,7 +72,7 @@ fi
 
 # Skip rotation on very low battery to avoid state desync during sudden shutdown.
 BATT_INFO=$(pmset -g batt 2>/dev/null || true)
-if grep -q "Battery Power" <<< "$BATT_INFO" || grep -q "Discharging" <<< "$BATT_INFO"; then
+if grep -qi "Battery Power" <<< "$BATT_INFO" || grep -qi "Discharging" <<< "$BATT_INFO"; then
     BATT_PCT=$(echo "$BATT_INFO" | grep -oE '[0-9]+%' | tr -d '%' | head -n 1)
     if [[ -n "$BATT_PCT" && "$BATT_PCT" -lt 10 ]]; then
         echo "[WARNING] Battery is below 10% ($BATT_PCT%). Skipping rotation."
