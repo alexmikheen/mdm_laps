@@ -1,0 +1,28 @@
+# Fleet GitOps configuration for GoLAPS deployment on macOS and Windows.
+# Replace placeholder URLs, SHA-256 hashes, and team name before applying.
+name: Workstations
+
+controls:
+  apple_settings:
+    configuration_profiles:
+      # Deploy managed preferences for the io.github.golaps domain.
+      - path: ../../profiles/macos/admin_config.mobileconfig
+  scripts:
+    # Register macOS and Windows trigger scripts for manual runs and policy automation.
+    - path: ./scripts/run-golaps-macos.sh
+    - path: ./scripts/run-golaps-windows.ps1
+
+software:
+  packages:
+    # macOS installer package built by scripts/build/build.sh.
+    - url: https://releases.example.com/golaps/golaps_v1.0.0.pkg
+      hash_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+      self_service: false
+    # Windows executable built by scripts/build/build.sh.
+    - url: https://releases.example.com/golaps/golaps_windows_amd64.exe
+      hash_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+      self_service: false
+
+policies:
+  # Load GoLAPS compliance and automatic remediation policies.
+  - path: ./policies/golaps-policies.yml

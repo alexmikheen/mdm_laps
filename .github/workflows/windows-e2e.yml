@@ -1,0 +1,126 @@
+name: Windows E2E Test
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'deploy/fleet/scripts/run-golaps-windows.ps1'
+      - '.github/workflows/windows-e2e.yml'
+  pull_request:
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'deploy/fleet/scripts/run-golaps-windows.ps1'
+
+jobs:
+  windows-e2e:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run go vet and unit tests on Windows
+        shell: pwsh
+        run: |
+          go vet ./...
+          go test -v ./cmd ./internal/config ./internal/core ./internal/password ./internal/osmgmt ./internal/vault
+
+      - name: Build golaps.exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "C:\Program Files\GoLAPS" | Out-Null
+          go build -trimpath -ldflags="-s -w" -o "C:\Program Files\GoLAPS\golaps.exe" ./cmd/main.go
+
+      - name: Start local HashiCorp Vault dev server
+        shell: pwsh
+        run: |
+          $vaultVersion = "1.18.4"
+          $zipPath = "$env:TEMP\vault.zip"
+          Invoke-WebRequest -Uri "https://releases.hashicorp.com/vault/${vaultVersion}/vault_${vaultVersion}_windows_amd64.zip" -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath "$env:TEMP\vault-bin" -Force
+          Start-Process -FilePath "$env:TEMP\vault-bin\vault.exe" `
+            -ArgumentList "server", "-dev", "-dev-root-token-id=golaps-e2e-token", "-dev-listen-address=127.0.0.1:18200" `
+            -NoNewWindow
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:18200/v1/sys/health" -UseBasicParsing -TimeoutSec 2
+              if ($r.StatusCode -eq 200) { Write-Host "Vault is ready"; break }
+            } catch {
+              Start-Sleep -Seconds 1
+            }
+          }
+
+      - name: Run Fleet Windows trigger script (create + rotate + verify Vault and OS state)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Simulate Fleet server-side secret substitution on run-golaps-windows.ps1.
+          $scriptSrc = Get-Content -Raw "deploy/fleet/scripts/run-golaps-windows.ps1"
+          $rendered = $scriptSrc.Replace('$FLEET_SECRET_GOLAPS_VAULT_TOKEN', 'golaps-e2e-token')
+          $renderedPath = "$env:TEMP\run-golaps-windows-rendered.ps1"
+          Set-Content -Path $renderedPath -Value $rendered -NoNewline
+
+          $env:LAPS_ADMIN_USER = "GoLAPSAdmin"
+          $env:LAPS_VAULT_TYPE = "hashicorp"
+          $env:LAPS_VAULT_ID = "laps"
+          $env:VAULT_ADDR = "http://127.0.0.1:18200"
+          $env:LAPS_VAULT_PATH = "secret/data/laps"
+
+          Write-Host "=== Run 1: Provision GoLAPSAdmin ==="
+          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $renderedPath
+          if ($LASTEXITCODE -ne 0) { throw "Run 1 failed with exit code $LASTEXITCODE" }
+
+          # Verify Windows local account and Administrators SID S-1-5-32-544 membership.
+          $u = Get-LocalUser -Name "GoLAPSAdmin"
+          if (-not $u.Enabled) { throw "GoLAPSAdmin is not enabled" }
+          $admins = Get-LocalGroupMember -SID 'S-1-5-32-544'
+          if (-not ($admins | Where-Object { $_.SID -eq $u.SID })) {
+            throw "GoLAPSAdmin is not in Administrators (S-1-5-32-544)"
+          }
+
+          # Read serial and verify Vault record.
+          $headers = @{ "X-Vault-Token" = "golaps-e2e-token" }
+          $list = Invoke-RestMethod -Method List -Uri "http://127.0.0.1:18200/v1/secret/metadata/laps" -Headers $headers
+          $serial = $list.data.keys[0]
+          Write-Host "Escrowed device serial: $serial"
+
+          $sec1 = (Invoke-RestMethod -Uri "http://127.0.0.1:18200/v1/secret/data/laps/$serial" -Headers $headers).data.data
+          if ($sec1.login -ne "GoLAPSAdmin") { throw "Unexpected login in Vault: $($sec1.login)" }
+          if ([string]::IsNullOrWhiteSpace($sec1.password) -or $sec1.password.Length -lt 16) { throw "Invalid password in Vault" }
+          if ($sec1.PSObject.Properties.Name -contains "pending_password") { throw "pending_password was not cleared" }
+          $pass1 = $sec1.password
+
+          Write-Host "=== Run 2: Rotate GoLAPSAdmin password ==="
+          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $renderedPath
+          if ($LASTEXITCODE -ne 0) { throw "Run 2 failed with exit code $LASTEXITCODE" }
+
+          $sec2 = (Invoke-RestMethod -Uri "http://127.0.0.1:18200/v1/secret/data/laps/$serial" -Headers $headers).data.data
+          if ($sec2.password -eq $pass1) { throw "Password did not change on Run 2" }
+          if ($sec2.PSObject.Properties.Name -contains "pending_password") { throw "pending_password was not cleared on Run 2" }
+          Write-Host "Run 1 & Run 2 verified successfully (password rotated, Administrators SID verified)."
+
+      - name: Verify Global\GoLAPS_RunLock kernel mutex blocks concurrent run
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $createdNew = $false
+          $mutex = [System.Threading.Mutex]::new($true, 'Global\GoLAPS_RunLock', [ref]$createdNew)
+          try {
+            if (-not $createdNew) { throw "Expected to acquire Global\GoLAPS_RunLock" }
+            $out = "golaps-e2e-token`n`n" | & "C:\Program Files\GoLAPS\golaps.exe" --secrets-from-stdin 2>&1 | Out-String
+            Write-Host $out
+            if ($LASTEXITCODE -ne 0) { throw "Expected exit 0 when lock is held, got $LASTEXITCODE" }
+            if ($out -notmatch 'Another GoLAPS run holds') { throw "Expected lock-held log message" }
+          } finally {
+            $mutex.ReleaseMutex()
+            $mutex.Dispose()
+          }
+          Write-Host "Global\GoLAPS_RunLock mutex test passed."

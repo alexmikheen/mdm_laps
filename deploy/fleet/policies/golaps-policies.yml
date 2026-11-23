@@ -1,0 +1,53 @@
+# GoLAPS compliance and automatic remediation policies for Fleet.
+# Replace example-admin with the AdminUser value from your managed configuration.
+
+- name: GoLAPS - macOS binary installed
+  platform: darwin
+  description: Verify that the GoLAPS binary is installed at /usr/local/bin/golaps.
+  resolution: Install the GoLAPS macOS package from Fleet software packages.
+  critical: false
+  query: >-
+    SELECT 1 FROM file
+    WHERE path = '/usr/local/bin/golaps' AND type = 'regular';
+
+- name: GoLAPS - macOS managed admin holds Secure Token and rotated recently
+  platform: darwin
+  description: >-
+    Verify that the managed administrator holds a Secure Token and that the GoLAPS log
+    updated within the last 30 days.
+  resolution: >-
+    Fleet runs run-golaps-macos.sh automatically on Fleet Premium, or run it manually
+    from the host Scripts tab.
+  critical: true
+  query: >-
+    SELECT 1
+    FROM plist p
+    JOIN file f ON f.path = '/Library/Logs/golaps.log'
+    WHERE p.path = '/var/db/dslocal/nodes/Default/users/example-admin.plist'
+      AND p.key = 'authentication_authority'
+      AND p.value LIKE '%SecureToken%'
+      AND f.mtime > (strftime('%s', 'now') - 2592000);
+  run_script:
+    path: ../scripts/run-golaps-macos.sh
+
+- name: GoLAPS - Windows binary installed
+  platform: windows
+  description: Verify that the GoLAPS executable is installed at C:\Program Files\GoLAPS\golaps.exe.
+  resolution: Install the GoLAPS Windows package from Fleet software packages.
+  critical: false
+  query: >-
+    SELECT 1 FROM file
+    WHERE path = 'C:\Program Files\GoLAPS\golaps.exe' AND type = 'regular';
+
+- name: GoLAPS - Windows managed admin account exists
+  platform: windows
+  description: Verify that the GoLAPS managed local administrator account exists on Windows.
+  resolution: >-
+    Fleet runs run-golaps-windows.ps1 automatically on Fleet Premium, or run it manually
+    from the host Scripts tab.
+  critical: true
+  query: >-
+    SELECT 1 FROM users
+    WHERE username = 'example-admin';
+  run_script:
+    path: ../scripts/run-golaps-windows.ps1
