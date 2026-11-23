@@ -53,7 +53,10 @@ $StartInfo.RedirectStandardInput = $true
 
 $Process = [System.Diagnostics.Process]::Start($StartInfo)
 try {
-    $Process.StandardInput.Write("$VaultToken`n`n")
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $Bytes = $Utf8NoBom.GetBytes("$($VaultToken.Trim())`n`n")
+    $Process.StandardInput.BaseStream.Write($Bytes, 0, $Bytes.Length)
+    $Process.StandardInput.BaseStream.Flush()
     $Process.StandardInput.Close()
     $Process.WaitForExit()
     $ExitCode = $Process.ExitCode
