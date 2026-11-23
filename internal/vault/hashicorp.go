@@ -1,13 +1,13 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
-// internal/vault/hashicorp.go
 package vault
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/vault/api"
@@ -44,16 +44,40 @@ func NewHashiCorpClient(address, token, path string) (*HashiCorpClient, error) {
 	}, nil
 }
 
+// isKVv2 reports whether the configured path targets a Vault KV v2 mount (e.g. "secret/data/laps").
+func (hc *HashiCorpClient) isKVv2() bool {
+	return strings.Contains(hc.path, "/data/") || strings.HasSuffix(hc.path, "/data")
+}
+
 // readData returns the device's current secret data, or an empty map when the secret does not exist yet.
 func (hc *HashiCorpClient) readData(ctx context.Context, deviceID string) (map[string]interface{}, error) {
-	secret, err := hc.client.Logical().ReadWithContext(ctx, hc.path+"/"+deviceID)
+	return hc.readDataAt(ctx, hc.path+"/"+deviceID)
+}
+
+func (hc *HashiCorpClient) readDataAt(ctx context.Context, fullPath string) (map[string]interface{}, error) {
+	secret, err := hc.client.Logical().ReadWithContext(ctx, fullPath)
 	if err != nil {
 		return nil, err
 	}
 	if secret == nil || secret.Data == nil {
 		return map[string]interface{}{}, nil
 	}
+	if hc.isKVv2() {
+		if inner, ok := secret.Data["data"].(map[string]interface{}); ok && inner != nil {
+			return inner, nil
+		}
+		return map[string]interface{}{}, nil
+	}
 	return secret.Data, nil
+}
+
+func (hc *HashiCorpClient) writeDataAt(ctx context.Context, fullPath string, data map[string]interface{}) error {
+	payload := data
+	if hc.isKVv2() {
+		payload = map[string]interface{}{"data": data}
+	}
+	_, err := hc.client.Logical().WriteWithContext(ctx, fullPath, payload)
+	return err
 }
 
 func (hc *HashiCorpClient) GetCredentials(ctx context.Context, deviceID, vaultID, targetAdmin string) (*Credentials, error) {
@@ -80,6 +104,12 @@ func (hc *HashiCorpClient) GetCredentials(ctx context.Context, deviceID, vaultID
 	if pending, ok := data["pending_password"].(string); ok && pending != "" {
 		res.PendingPassword = pending
 	}
+	if prevPending, ok := data["previous_pending_password"].(string); ok && prevPending != "" {
+		res.PreviousPendingPassword = prevPending
+	}
+	if bridgePass, ok := data["bridge_password"].(string); ok && bridgePass != "" {
+		res.BridgePassword = bridgePass
+	}
 	if legacyLogin, ok := data["legacy_login"].(string); ok && legacyLogin != "" {
 		res.LegacyLogin = legacyLogin
 	}
@@ -95,7 +125,7 @@ func (hc *HashiCorpClient) GetCredentials(ctx context.Context, deviceID, vaultID
 	return res, nil
 }
 
-// StagePendingPassword escrows the candidate password before the device is touched. Read-modify-write so the existing record (current password, legacy data) survives the stage.
+// StagePendingPassword stores the candidate before OS rotation and preserves existing fields.
 func (hc *HashiCorpClient) StagePendingPassword(ctx context.Context, creds *Credentials, deviceID, hostname, vaultID, newLogin, newPassword string) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -106,16 +136,19 @@ func (hc *HashiCorpClient) StagePendingPassword(ctx context.Context, creds *Cred
 	}
 	data["hostname"] = hostname
 	data["serial"] = deviceID
+	if old, ok := data["pending_password"].(string); ok && old != "" && old != newPassword {
+		data["previous_pending_password"] = old
+	}
 	data["pending_password"] = newPassword
 
-	if _, err := hc.client.Logical().WriteWithContext(ctx, hc.path+"/"+deviceID, data); err != nil {
+	if err := hc.writeDataAt(ctx, hc.path+"/"+deviceID, data); err != nil {
 		return fmt.Errorf("could not stage the pending password: %w", err)
 	}
 	creds.ItemID = hc.path + "/" + deviceID
 	return nil
 }
 
-// ClearPendingPassword drops the staged value after a rotation the device policy refused.
+// ClearPendingPassword removes the staged value after a policy-rejected rotation.
 func (hc *HashiCorpClient) ClearPendingPassword(ctx context.Context, creds *Credentials, vaultID string) error {
 	if creds.ItemID == "" {
 		return nil
@@ -123,50 +156,115 @@ func (hc *HashiCorpClient) ClearPendingPassword(ctx context.Context, creds *Cred
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	secret, err := hc.client.Logical().ReadWithContext(ctx, creds.ItemID)
+	data, err := hc.readDataAt(ctx, creds.ItemID)
 	if err != nil {
 		return err
 	}
-	if secret == nil || secret.Data == nil {
+	if len(data) == 0 {
 		return nil
 	}
-	delete(secret.Data, "pending_password")
-	_, err = hc.client.Logical().WriteWithContext(ctx, creds.ItemID, secret.Data)
-	return err
+	delete(data, "pending_password")
+	if prev, ok := data["previous_pending_password"].(string); ok && prev != "" {
+		data["pending_password"] = prev
+		delete(data, "previous_pending_password")
+	}
+	return hc.writeDataAt(ctx, creds.ItemID, data)
+}
+
+func (hc *HashiCorpClient) ConfirmLivePassword(ctx context.Context, creds *Credentials, deviceID, hostname, vaultID, login, live string) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	data, err := hc.readData(ctx, deviceID)
+	if err != nil {
+		return err
+	}
+	if creds.IsMigration && creds.OldLogin != "" {
+		if existing, _ := data["legacy_login"].(string); existing == "" {
+			data["legacy_login"] = creds.OldLogin
+			data["legacy_password"] = creds.OldPassword
+		}
+	}
+	data["hostname"] = hostname
+	data["serial"] = deviceID
+	data["login"] = login
+	data["password"] = live
+	delete(data, "pending_password")
+	delete(data, "previous_pending_password")
+	if err := hc.writeDataAt(ctx, hc.path+"/"+deviceID, data); err != nil {
+		return err
+	}
+	creds.recordConfirmed(login, live)
+	return nil
+}
+
+func (hc *HashiCorpClient) StageBridgePassword(ctx context.Context, creds *Credentials, vaultID, password string) error {
+	if creds.ItemID == "" {
+		return fmt.Errorf("device has no vault record yet; cannot escrow bridge password")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	data, err := hc.readDataAt(ctx, creds.ItemID)
+	if err != nil {
+		return err
+	}
+	data["bridge_password"] = password
+	if err := hc.writeDataAt(ctx, creds.ItemID, data); err != nil {
+		return err
+	}
+	creds.BridgePassword = password
+	return nil
+}
+
+func (hc *HashiCorpClient) ClearBridgePassword(ctx context.Context, creds *Credentials, vaultID string) error {
+	if creds.ItemID == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	data, err := hc.readDataAt(ctx, creds.ItemID)
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 {
+		creds.BridgePassword = ""
+		return nil
+	}
+	delete(data, "bridge_password")
+	if err := hc.writeDataAt(ctx, creds.ItemID, data); err != nil {
+		return err
+	}
+	creds.BridgePassword = ""
+	return nil
 }
 
 func (hc *HashiCorpClient) UpsertCredentials(ctx context.Context, creds *Credentials, deviceID, hostname, vaultID, newLogin, newPassword, tokenStatus string) error {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	data := map[string]interface{}{
-		"hostname":     hostname,
-		"serial":       deviceID,
-		"login":        newLogin,
-		"password":     newPassword,
-		"secure_token": tokenStatus,
-		"updated_at":   time.Now().Unix(),
+	// Read-modify-write so bridge_password and existing legacy_* fields survive until explicitly cleared.
+	data, err := hc.readData(ctx, deviceID)
+	if err != nil {
+		return err
 	}
-	// The rebuilt map intentionally carries no pending_password: committing the real password IS the confirming write that retires the staged copy.
-
-	// Add legacy credentials if migrating
 	if creds.IsMigration && creds.OldLogin != "" {
-		data["old_login"] = creds.OldLogin
-		data["old_password"] = creds.OldPassword
-
-		// Store in legacy format
-		legacyKey := fmt.Sprintf("legacy_%s", creds.OldLogin)
-		legacyData := map[string]string{
-			"login":    creds.OldLogin,
-			"password": creds.OldPassword,
+		if existing, _ := data["legacy_login"].(string); existing == "" {
+			data["legacy_login"] = creds.OldLogin
+			data["legacy_password"] = creds.OldPassword
 		}
-		legacyJSON, _ := json.Marshal(legacyData)
-		data[legacyKey] = string(legacyJSON)
 	}
+	data["hostname"] = hostname
+	data["serial"] = deviceID
+	data["login"] = newLogin
+	data["password"] = newPassword
+	data["secure_token"] = tokenStatus
+	data["updated_at"] = time.Now().Unix()
+	delete(data, "pending_password")
+	delete(data, "previous_pending_password")
 
-	// Write to vault
-	_, err := hc.client.Logical().WriteWithContext(ctx, hc.path+"/"+deviceID, data)
-	return err
+	return hc.writeDataAt(ctx, hc.path+"/"+deviceID, data)
 }
 
 // Helper to parse legacy data

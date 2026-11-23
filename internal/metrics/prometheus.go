@@ -1,13 +1,15 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
-// internal/metrics/prometheus.go
 package metrics
 
 import (
+	"context"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -19,20 +21,21 @@ type PrometheusMetrics struct {
 	passwordRotationErrors prometheus.Counter
 	rotationDuration       prometheus.Histogram
 	secureTokenStatus      prometheus.Gauge
+	server                 *http.Server
 }
 
 var (
-	metricsInstance *PrometheusMetrics
+	metricsInstance atomic.Pointer[PrometheusMetrics]
 	metricsOnce     sync.Once
 )
 
 func InitPrometheus(port string, enabled bool) *PrometheusMetrics {
-	metricsOnce.Do(func() {
-		if !enabled {
-			return
-		}
+	if !enabled {
+		return nil
+	}
 
-		metricsInstance = &PrometheusMetrics{
+	metricsOnce.Do(func() {
+		pm := &PrometheusMetrics{
 			passwordRotations: prometheus.NewCounter(prometheus.CounterOpts{
 				Name: "laps_password_rotations_total",
 				Help: "Total number of successful password rotations",
@@ -52,23 +55,41 @@ func InitPrometheus(port string, enabled bool) *PrometheusMetrics {
 			}),
 		}
 
-		// Register metrics
-		prometheus.MustRegister(metricsInstance.passwordRotations)
-		prometheus.MustRegister(metricsInstance.passwordRotationErrors)
-		prometheus.MustRegister(metricsInstance.rotationDuration)
-		prometheus.MustRegister(metricsInstance.secureTokenStatus)
+		prometheus.MustRegister(pm.passwordRotations)
+		prometheus.MustRegister(pm.passwordRotationErrors)
+		prometheus.MustRegister(pm.rotationDuration)
+		prometheus.MustRegister(pm.secureTokenStatus)
 
-		// Start HTTP server for metrics endpoint
-		http.Handle("/metrics", promhttp.Handler())
+		listenAddr := port
+		if strings.HasPrefix(listenAddr, ":") {
+			listenAddr = "127.0.0.1" + listenAddr
+		}
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		srv := &http.Server{
+			Addr:              listenAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		pm.server = srv
+		metricsInstance.Store(pm)
+
 		go func() {
-			log.Printf("[INFO] Prometheus metrics server starting on %s", port)
-			if err := http.ListenAndServe(port, nil); err != nil {
+			log.Printf("[INFO] Prometheus metrics server starting on %s", listenAddr)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				log.Printf("[ERROR] Prometheus metrics server failed: %v", err)
 			}
 		}()
 	})
 
-	return metricsInstance
+	return metricsInstance.Load()
+}
+
+func (pm *PrometheusMetrics) Shutdown(ctx context.Context) error {
+	if pm == nil || pm.server == nil {
+		return nil
+	}
+	return pm.server.Shutdown(ctx)
 }
 
 func (pm *PrometheusMetrics) RecordPasswordRotation(success bool, duration time.Duration) {
@@ -97,7 +118,6 @@ func (pm *PrometheusMetrics) SetSecureTokenStatus(enabled bool) {
 	}
 }
 
-// GetMetrics returns the singleton instance
 func GetMetrics() *PrometheusMetrics {
-	return metricsInstance
+	return metricsInstance.Load()
 }

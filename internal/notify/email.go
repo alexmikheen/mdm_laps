@@ -1,7 +1,6 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
-// internal/notify/email.go
 package notify
 
 import (
@@ -60,6 +59,7 @@ Status: %s
 	m.SetBody("text/plain", body)
 
 	d := mail.NewDialer(e.smtpHost, e.smtpPort, e.username, e.password)
+	d.StartTLSPolicy = mail.MandatoryStartTLS
 
 	if err := d.DialAndSend(m); err != nil {
 		return fmt.Errorf("failed to send email: %w", err)

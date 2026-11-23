@@ -1,49 +1,72 @@
 #!/bin/bash
 # Copyright 2026 Aleksandr Mikheenko
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 
 # ==============================================================================
-# Script Name: LAPS Execution & Keychain Sync (macOS)
-# Description: Sends a vault token to macOS Keychain and executes the LAPS updater.
+# Script Name: laps_token_minimal.sh (macOS)
+# Description: Passes the vault token to golaps over stdin (--secrets-from-stdin)
+# so the secret never appears in process arguments or System.keychain.
 # ==============================================================================
+set -uo pipefail
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 LAPS_VAULT_TOKEN="__VAULT_SERVICE_TOKEN__"
-KEYCHAIN="/Library/Keychains/System.keychain"
-KEYCHAIN_LABEL="GoLAPS_Vault_Token"
+LEGACY_ADMIN_PASS=""
 LAPS_BINARY="/usr/local/bin/golaps"
 
-# --- GUARANTEED CLEANUP ---
 cleanup() {
-    echo "[INFO] Removing token from System Keychain..."
-    security delete-generic-password -l "$KEYCHAIN_LABEL" "$KEYCHAIN" >/dev/null 2>&1
+    unset LAPS_VAULT_TOKEN LEGACY_ADMIN_PASS
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+verify_trusted_binary() {
+    local target="$1"
+    if [ -L "$target" ] || [ ! -f "$target" ]; then
+        echo "[ERROR] $target is missing or a symbolic link."
+        return 1
+    fi
+    local p="$target"
+    while :; do
+        if [ -L "$p" ]; then
+            echo "[ERROR] Untrusted path: $p is a symbolic link."
+            return 1
+        fi
+        local uid mode
+        uid=$(stat -f '%u' "$p" 2>/dev/null) || return 1
+        mode=$(stat -f '%Lp' "$p" 2>/dev/null) || return 1
+        if [ "$uid" != "0" ]; then
+            echo "[ERROR] Untrusted path: $p is owned by uid $uid, not root."
+            return 1
+        fi
+        if (( (8#$mode & 022) != 0 )); then
+            echo "[ERROR] Untrusted path: $p is writable by group or other (mode $mode)."
+            return 1
+        fi
+        [ "$p" = "/" ] && break
+        p=$(dirname "$p")
+    done
+    return 0
+}
 
 if [ "$LAPS_VAULT_TOKEN" == "__VAULT_SERVICE_TOKEN__" ] || [ -z "$LAPS_VAULT_TOKEN" ]; then
     echo "[ERROR] Vault service token is not configured."
     exit 1
 fi
 
-# --- 1. TOKEN PROVISIONING (SYSTEM KEYCHAIN) ---
-echo "[INFO] Injecting vault service token into System Keychain..."
-security delete-generic-password -l "$KEYCHAIN_LABEL" "$KEYCHAIN" >/dev/null 2>&1
-security add-generic-password -a "ServiceAccount" -l "$KEYCHAIN_LABEL" -s "GoLAPSVaultToken" -w "$LAPS_VAULT_TOKEN" -A "$KEYCHAIN"
-echo "[SUCCESS] Token secured in System Keychain."
+if ! verify_trusted_binary "$LAPS_BINARY"; then
+    exit 1
+fi
 
-# --- 2. EXECUTE THE LAPS UPDATER ---
-if [ -f "$LAPS_BINARY" ]; then
-    echo "[INFO] Starting LAPS rotation process..."
-    "$LAPS_BINARY"
-    EXIT_CODE=$?
+echo "[INFO] Starting GoLAPS rotation process..."
+printf '%s\n%s\n' "$LAPS_VAULT_TOKEN" "$LEGACY_ADMIN_PASS" | "$LAPS_BINARY" --secrets-from-stdin
+EXIT_CODE=$?
 
-    if [ $EXIT_CODE -eq 0 ]; then
-        echo "[SUCCESS] LAPS rotation completed successfully."
-        exit 0
-    else
-        echo "[ERROR] LAPS binary failed with exit code $EXIT_CODE."
-        exit 1
-    fi
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "[SUCCESS] GoLAPS rotation completed successfully."
+    exit 0
 else
-    echo "[ERROR] LAPS binary not found at $LAPS_BINARY."
+    echo "[ERROR] GoLAPS binary failed with exit code $EXIT_CODE."
     exit 1
 fi

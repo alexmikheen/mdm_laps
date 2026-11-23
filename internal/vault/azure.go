@@ -1,15 +1,17 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
-// internal/vault/azure.go
 package vault
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/keyvault/azsecrets"
 )
@@ -19,36 +21,35 @@ type AzureClient struct {
 }
 
 func NewAzureClient(tenantID, clientID, clientSecret, vaultURL string) (*AzureClient, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Create credential using service principal
 	cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, clientSecret, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create azure credential: %w", err)
 	}
+	return NewAzureClientWithCredential(vaultURL, cred, nil)
+}
 
-	// Create secrets client
-	client, err := azsecrets.NewClient(vaultURL, cred, nil)
+// NewAzureClientWithCredential builds an AzureClient with any azcore.TokenCredential and optional ClientOptions (enabling managed identities, custom HTTP transports, or local emulators such as lowkey-vault).
+func NewAzureClientWithCredential(vaultURL string, cred azcore.TokenCredential, opts *azsecrets.ClientOptions) (*AzureClient, error) {
+	client, err := azsecrets.NewClient(vaultURL, cred, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create azure secrets client: %w", err)
 	}
-
-	// Test connection
-	_, err = client.GetSecret(ctx, "health-check", "", nil)
-	// We expect an error for non-existent secret, but connection should work Just verify we can make calls
 
 	return &AzureClient{
 		client: client,
 	}, nil
 }
 
-// readData returns the device's current secret map, or an empty map when the secret does not exist yet.
+// readData returns the device's current secret map, or an empty map when the secret does not exist yet (HTTP 404).
+// Auth, permission, and connectivity errors are propagated so GoLAPS aborts before rotating.
 func (ac *AzureClient) readData(ctx context.Context, secretName string) (map[string]string, error) {
 	secretBundle, err := ac.client.GetSecret(ctx, secretName, "", nil)
 	if err != nil {
-		// Secret might not exist yet
-		return map[string]string{}, nil
+		var respErr *azcore.ResponseError
+		if errors.As(err, &respErr) && respErr.StatusCode == http.StatusNotFound {
+			return map[string]string{}, nil
+		}
+		return nil, err
 	}
 	secretData := map[string]string{}
 	if secretBundle.Value != nil {
@@ -104,6 +105,12 @@ func (ac *AzureClient) GetCredentials(ctx context.Context, deviceID, vaultID, ta
 	if pending, ok := secretData["pending_password"]; ok && pending != "" {
 		res.PendingPassword = pending
 	}
+	if prevPending, ok := secretData["previous_pending_password"]; ok && prevPending != "" {
+		res.PreviousPendingPassword = prevPending
+	}
+	if bridgePass, ok := secretData["bridge_password"]; ok && bridgePass != "" {
+		res.BridgePassword = bridgePass
+	}
 	if legacyLogin, ok := secretData["legacy_login"]; ok && legacyLogin != "" {
 		res.LegacyLogin = legacyLogin
 	}
@@ -119,7 +126,7 @@ func (ac *AzureClient) GetCredentials(ctx context.Context, deviceID, vaultID, ta
 	return res, nil
 }
 
-// StagePendingPassword escrows the candidate password before the device is touched. Read-modify-write so the existing record (current password, legacy data) survives the stage.
+// StagePendingPassword stores the candidate before OS rotation and preserves existing fields.
 func (ac *AzureClient) StagePendingPassword(ctx context.Context, creds *Credentials, deviceID, hostname, vaultID, newLogin, newPassword string) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -131,6 +138,9 @@ func (ac *AzureClient) StagePendingPassword(ctx context.Context, creds *Credenti
 	}
 	secretData["hostname"] = hostname
 	secretData["serial"] = deviceID
+	if old := secretData["pending_password"]; old != "" && old != newPassword {
+		secretData["previous_pending_password"] = old
+	}
 	secretData["pending_password"] = newPassword
 
 	if err := ac.writeData(ctx, secretName, secretData); err != nil {
@@ -140,7 +150,7 @@ func (ac *AzureClient) StagePendingPassword(ctx context.Context, creds *Credenti
 	return nil
 }
 
-// ClearPendingPassword drops the staged value after a rotation the device policy refused.
+// ClearPendingPassword removes the staged value after a policy-rejected rotation.
 func (ac *AzureClient) ClearPendingPassword(ctx context.Context, creds *Credentials, vaultID string) error {
 	if creds.ItemID == "" {
 		return nil
@@ -156,32 +166,103 @@ func (ac *AzureClient) ClearPendingPassword(ctx context.Context, creds *Credenti
 		return nil
 	}
 	delete(secretData, "pending_password")
+	if prev := secretData["previous_pending_password"]; prev != "" {
+		secretData["pending_password"] = prev
+		delete(secretData, "previous_pending_password")
+	}
 	return ac.writeData(ctx, creds.ItemID, secretData)
 }
 
-func (ac *AzureClient) UpsertCredentials(ctx context.Context, creds *Credentials, deviceID, hostname, vaultID, newLogin, newPassword, tokenStatus string) error {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+func (ac *AzureClient) ConfirmLivePassword(ctx context.Context, creds *Credentials, deviceID, hostname, vaultID, login, live string) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	secretName := fmt.Sprintf("laps-%s", deviceID)
-
-	// Prepare secret data. The rebuilt map intentionally carries no pending_password: committing the real password IS the confirming write.
-	secretData := map[string]string{
-		"hostname":     hostname,
-		"serial":       deviceID,
-		"login":        newLogin,
-		"password":     newPassword,
-		"secure_token": tokenStatus,
-		"updated_at":   time.Now().Format(time.RFC3339),
+	secretData, err := ac.readData(ctx, secretName)
+	if err != nil {
+		return err
 	}
-
-	// Add legacy credentials if migrating
-	if creds.IsMigration && creds.OldLogin != "" {
-		secretData["old_login"] = creds.OldLogin
-		secretData["old_password"] = creds.OldPassword
-		secretData["legacy_login"] = creds.LegacyLogin
-		secretData["legacy_password"] = creds.LegacyPassword
+	if creds.IsMigration && creds.OldLogin != "" && secretData["legacy_login"] == "" {
+		secretData["legacy_login"] = creds.OldLogin
+		secretData["legacy_password"] = creds.OldPassword
 	}
+	secretData["hostname"] = hostname
+	secretData["serial"] = deviceID
+	secretData["login"] = login
+	secretData["password"] = live
+	delete(secretData, "pending_password")
+	delete(secretData, "previous_pending_password")
+	if err := ac.writeData(ctx, secretName, secretData); err != nil {
+		return err
+	}
+	creds.recordConfirmed(login, live)
+	return nil
+}
+
+func (ac *AzureClient) StageBridgePassword(ctx context.Context, creds *Credentials, vaultID, password string) error {
+	if creds.ItemID == "" {
+		return fmt.Errorf("device has no vault record yet; cannot escrow bridge password")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	secretData, err := ac.readData(ctx, creds.ItemID)
+	if err != nil {
+		return err
+	}
+	secretData["bridge_password"] = password
+	if err := ac.writeData(ctx, creds.ItemID, secretData); err != nil {
+		return err
+	}
+	creds.BridgePassword = password
+	return nil
+}
+
+func (ac *AzureClient) ClearBridgePassword(ctx context.Context, creds *Credentials, vaultID string) error {
+	if creds.ItemID == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	secretData, err := ac.readData(ctx, creds.ItemID)
+	if err != nil {
+		return err
+	}
+	if len(secretData) == 0 {
+		creds.BridgePassword = ""
+		return nil
+	}
+	delete(secretData, "bridge_password")
+	if err := ac.writeData(ctx, creds.ItemID, secretData); err != nil {
+		return err
+	}
+	creds.BridgePassword = ""
+	return nil
+}
+
+func (ac *AzureClient) UpsertCredentials(ctx context.Context, creds *Credentials, deviceID, hostname, vaultID, newLogin, newPassword, tokenStatus string) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	secretName := fmt.Sprintf("laps-%s", deviceID)
+	// Read-modify-write so bridge_password and existing legacy_* fields survive until explicitly cleared.
+	secretData, err := ac.readData(ctx, secretName)
+	if err != nil {
+		return err
+	}
+	if creds.IsMigration && creds.OldLogin != "" && secretData["legacy_login"] == "" {
+		secretData["legacy_login"] = creds.OldLogin
+		secretData["legacy_password"] = creds.OldPassword
+	}
+	secretData["hostname"] = hostname
+	secretData["serial"] = deviceID
+	secretData["login"] = newLogin
+	secretData["password"] = newPassword
+	secretData["secure_token"] = tokenStatus
+	secretData["updated_at"] = time.Now().Format(time.RFC3339)
+	delete(secretData, "pending_password")
+	delete(secretData, "previous_pending_password")
 
 	return ac.writeData(ctx, secretName, secretData)
 }

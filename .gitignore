@@ -1,0 +1,7 @@
+.DS_Store
+release/
+*.pkg
+*.exe
+*.sha256
+.env
+.env.

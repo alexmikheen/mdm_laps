@@ -1,16 +1,18 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,27 +26,58 @@ const (
 	localLogPath     = "/Library/Logs/golaps.log"
 	localLogMaxLines = 2000
 
-	// MDM platforms commonly hard-kill a custom script around 60 minutes. The whole run is budgeted below that so LAPS aborts on its own terms — the alternative is being killed mid-vault-write, which loses the rotated password. The budget starts here, at process start: measuring it from the GUI prompt (as the constants in osmgmt used to) ignored everything the run had already spent on the vault list, the rotation and the token-holder scan.
-	mdmKillLimit = 60 * time.Minute
-	runBudget    = mdmKillLimit - 5*time.Minute
+	mdmKillLimit    = 60 * time.Minute
+	runBudget       = mdmKillLimit - 5*time.Minute
+	minRunBudget    = 20 * time.Minute
+	startupDelayEnv = "LAPS_STARTUP_DELAY_SECONDS"
 )
 
+func effectiveRunBudget(delayEnv string) time.Duration {
+	budget := runBudget
+	if secs, err := strconv.Atoi(strings.TrimSpace(delayEnv)); err == nil && secs > 0 {
+		budget -= time.Duration(secs) * time.Second
+	}
+	if budget < minRunBudget {
+		budget = minRunBudget
+	}
+	return budget
+}
+
 func tailCapLog(path string) {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 {
+		return
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return // nothing to cap yet
+		return
 	}
 	lines := strings.Split(string(data), "\n")
 	if len(lines) <= localLogMaxLines {
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strings.Join(lines[len(lines)-localLogMaxLines:], "\n")), 0o640); err != nil {
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), ".golaps-log-*")
+	if err != nil {
 		return
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	tmpName := tmpFile.Name()
+	if err := tmpFile.Chmod(0o600); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpName)
+		return
+	}
+	if _, err := tmpFile.WriteString(strings.Join(lines[len(lines)-localLogMaxLines:], "\n")); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpName)
+		return
+	}
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpName)
+		return
+	}
+	if err := os.Rename(tmpName, path); err != nil {
 		log.Printf("[WARNING] Could not rotate the local log: %v", err)
-		os.Remove(tmp) // don't leave a copy of the log behind under a second name
+		os.Remove(tmpName)
 	}
 }
 
@@ -60,36 +93,58 @@ func setupLocalLog() func() {
 	}
 	tailCapLog(localLogPath)
 
-	// Under MDM this runs as root and the file is writable. On a manual non-root run the MDM/stdout output is still complete and only the local copy is skipped.
-	f, err := os.OpenFile(localLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+	f, err := openLogNoFollow(localLogPath)
 	if err != nil {
 		log.Printf("[WARNING] Could not open local log %s: %v", localLogPath, err)
 		return noop
+	}
+	if err := f.Chmod(0o600); err != nil {
+		log.Printf("[WARNING] Could not set the local log mode: %v", err)
 	}
 
 	log.SetOutput(io.MultiWriter(os.Stderr, f))
 	return func() { f.Close() }
 }
 
-// capabilities is what laps_token.sh asks for instead of comparing version numbers. A hardcoded threshold in the script is wrong exactly once: observed in production, a version gate handed devices over to a binary whose locked-account recreation only landed one release later. An older binary does not know this flag, prints nothing and exits non-zero, which the script reads as "cannot do it" — the safe answer.
 var capabilities = []string{
-	"recreate-locked",    // heals an account that holds a token but cannot authenticate
-	"structured-outcome", // change_password reports the failure class, not just success/failure
-	"verified-reset",     // an administrative reset refused by opendirectoryd is never reported as success
-	"last-admin-bridge",  // can delete the last admin by bridging the guard with a temporary bridge admin
-	"bt-aware",           // a failed token grant on a device with a local PRK + escrowed bootstrap token reports as a warning instead of a failure; the GUI prompt still runs every check-in
+	"recreate-locked",
+	"structured-outcome",
+	"verified-reset",
+	"last-admin-bridge",
+	"bt-aware",
+	"preflight",
+	"conflict-guard",
+	"tokenless-in-place",
+	"heal-cooldown",
+	"bridge-safety",
+	"secrets-stdin",
 }
 
 func main() {
-	// Answered before anything else: no config, no vault, no keychain — the script may call this on a device where none of that is set up yet.
+	if runtime.GOOS != "windows" {
+		if err := disableCoreDumps(); err != nil {
+			log.Printf("[WARNING] Could not disable core dumps: %v", err)
+		}
+	}
+
 	if len(os.Args) > 1 && os.Args[1] == "--capabilities" {
 		fmt.Println(strings.Join(capabilities, " "))
 		return
 	}
 
+	// Acquire the run lock before rotating the log so an overlapping process cannot unlink the active log inode.
+	lock, held, err := acquireRunLock(runLockPath)
+	if err != nil {
+		log.Printf("[WARNING] Could not take the run lock %s: %v", runLockPath, err)
+	}
+	if held {
+		log.Printf("[INFO] Another GoLAPS run holds %s; this run exits and leaves the rotation to it.", runLockPath)
+		os.Exit(0)
+	}
+	runLock = lock
+
 	closeLocalLog := setupLocalLog()
 
-	// os.Exit skips deferred calls, so the close is explicit on every path below.
 	fail := func(format string, args ...any) {
 		log.Printf(format, args...)
 		closeLocalLog()
@@ -98,7 +153,11 @@ func main() {
 
 	log.Println("====================================================")
 
-	ctx, cancel := context.WithTimeout(context.Background(), runBudget)
+	budget := effectiveRunBudget(os.Getenv(startupDelayEnv))
+	if budget != runBudget {
+		log.Printf("[INFO] The trigger waited %ss before this run; the run budget is %s instead of %s.\n", os.Getenv(startupDelayEnv), budget, runBudget)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 
 	cfg, err := config.Load(ctx)
@@ -106,19 +165,44 @@ func main() {
 		fail("[ERROR] Config Init Failed: %v", err)
 	}
 
+	// Scrub secret env vars so no child process can inherit them.
+	for _, k := range []string{
+		"LAPS_VAULT_TOKEN",
+		"OP_SERVICE_ACCOUNT_TOKEN",
+		"VAULT_TOKEN",
+		"LEGACY_ADMIN_PASS",
+		"BWS_ACCESS_TOKEN",
+		"BW_API_KEY",
+		"AZURE_CLIENT_SECRET",
+	} {
+		os.Unsetenv(k)
+	}
+
 	osMgr := osmgmt.NewManager()
 
 	if runtime.GOOS == "darwin" {
-		// The token now lives in this process's memory; the copy in the System keychain is no longer needed. A failure here is not fatal (laps_token.sh also removes it on exit), but it must not pass unnoticed either.
 		if err := osMgr.DeleteServiceAccountToken(ctx); err != nil {
 			log.Printf("[WARNING] Could not shred the vault token from the Keychain: %v", err)
 		}
+	}
+
+	if err := osMgr.Preflight(ctx, cfg.AdminUser, cfg.ProbeURL); err != nil {
+		if errors.Is(err, osmgmt.ErrSkipRun) {
+			log.Printf("[INFO] Run skipped: %v", err)
+			closeLocalLog()
+			os.Exit(0)
+		}
+		fail("[ERROR] %v", err)
 	}
 
 	vClient, err := newVaultClient(ctx, cfg)
 	if err != nil {
 		fail("[ERROR] Vault Init Failed: %v", err)
 	}
+
+	// Scrub AWS runtime credentials once the AWS SDK client has initialized so no child process inherits them.
+	os.Unsetenv("AWS_SECRET_ACCESS_KEY")
+	os.Unsetenv("AWS_SESSION_TOKEN")
 
 	if err := core.RunLAPS(ctx, cfg, osMgr, vClient); err != nil {
 		fail("[ERROR] %v", err)

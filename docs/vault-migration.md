@@ -2,47 +2,45 @@
 
 ## Supported Vault Providers
 
-GoLAPS supports the following secret management systems:
+GoLAPS supports five secret management providers:
 
 ### 1. 1Password Secrets Automation
-- **Best for**: Teams already using 1Password
+- **Best for**: Teams that already use 1Password
 - **Setup**: Create a service account in 1Password
 - **Env vars**: `LAPS_VAULT_TOKEN` or `OP_SERVICE_ACCOUNT_TOKEN`, plus `LAPS_VAULT_ID`
 
 ### 2. HashiCorp Vault
 - **Best for**: Self-hosted enterprise deployments
-- **Setup**: Deploy Vault server, create KV secrets engine
+- **Setup**: Deploy a Vault server and enable a KV secrets engine
 - **Env vars**: `VAULT_ADDR`, `LAPS_VAULT_TOKEN` or `VAULT_TOKEN`, plus `LAPS_VAULT_PATH`
 
 ### 3. Bitwarden Secrets Manager
-- **Best for**: Open-source focused organizations
-- **Setup**: Create API key in Bitwarden organization
-- **Env vars**: `BW_SERVER_URL`, `BW_API_KEY`, `BW_ORG_ID`
+- **Best for**: Teams that use Bitwarden Secrets Manager
+- **Setup**: Build with `CGO_ENABLED=1 go build -tags=bitwarden_sdk` and create a machine account token
+- **Env vars**: `BWS_ACCESS_TOKEN` (or `LAPS_VAULT_TOKEN`), `LAPS_VAULT_ID` (project ID), optional `BWS_API_URL` and `BWS_IDENTITY_URL`
 
 ### 4. AWS Secrets Manager
-- **Best for**: AWS-centric infrastructure
-- **Setup**: IAM role with Secrets Manager permissions
-- **Env vars**: `AWS_REGION`, `AWS_PROFILE` (or IAM role)
+- **Best for**: AWS infrastructure
+- **Setup**: Create an IAM role with Secrets Manager permissions
+- **Env vars**: `AWS_REGION`, `AWS_PROFILE` (or IAM role), optional `AWS_ENDPOINT_URL`
 
 ### 5. Azure Key Vault
-- **Best for**: Microsoft/Azure environments, macOS fleets in Azure AD
-- **Setup**: Service principal with Key Vault access
+- **Best for**: Microsoft Azure environments
+- **Setup**: Create a service principal with Key Vault access
 - **Env vars**: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_VAULT_URL`
 
-## The staged (pending) password field
+## The Staged (Pending) Password Field
 
-Every provider stores, next to the current credential, a **staged password** field
-(`field_pending_password` in 1Password, `pending_password` in the key/value providers). GoLAPS
-writes the new password there *before* rotating the device and drops it on the confirming write —
-see [architecture.md](architecture.md). When migrating records between providers, carry this field
-over if it is present: it may be the password the device actually holds.
+Every provider stores a **staged password** field next to the current credential (`field_pending_password` in 1Password, `pending_password` in key-value providers). GoLAPS writes the new password there before it rotates the device, then clears it on the final write. See [architecture.md](architecture.md).
+
+When you migrate records between providers, copy this field if it exists. It may hold the active password on the device.
 
 ## Migration Steps
 
 ### From 1Password to HashiCorp Vault
 
-1. Export data from 1Password
-2. Set up HashiCorp Vault KV engine:
+1. Export records from 1Password.
+2. Enable the HashiCorp Vault KV engine:
    ```bash
    vault secrets enable -path=secret kv-v2
    ```
@@ -56,7 +54,7 @@ over if it is present: it may be the password the device actually holds.
 
 ### From Any Provider to AWS Secrets Manager
 
-1. Create IAM policy:
+1. Create an IAM policy:
 ```json
 {
   "Version": "2012-10-17",
@@ -72,7 +70,7 @@ over if it is present: it may be the password the device actually holds.
 }
 ```
 
-2. Update environment:
+2. Update environment variables:
    ```bash
    export LAPS_VAULT_TYPE="aws"
    export AWS_REGION="us-east-1"
@@ -80,11 +78,10 @@ over if it is present: it may be the password the device actually holds.
 
 ## Configuration Examples
 
-See `configs/examples/config.example.env` and `configs/examples/laps_config.yaml` for complete examples.
+See `configs/examples/config.example.env` and `configs/examples/laps_config.yaml` for full examples.
 
-## Testing Your Configuration
+## Test Your Configuration
 
 ```bash
-# Test connection
-./golaps
+printf '%s\n\n' "$LAPS_VAULT_TOKEN" | sudo /usr/local/bin/golaps --secrets-from-stdin
 ```

@@ -8,11 +8,12 @@ Run the local build script from the repository root:
 ./scripts/build/build.sh
 ```
 
-The script asks for a version number, injects it into `internal/version/version.go` and the MDM
-audit script, and creates a `release/` directory with:
+The script sets the version in `internal/version/version.go` and `scripts/mdm/macos/audit_laps_customapp.sh`. It then creates a `release/` directory with these artifacts:
 
-- `golaps_windows_amd64.exe` + `.sha256` checksum
-- `golaps_v<version>.pkg` (macOS binary + Swift helper, built with `pkgbuild`)
+- `golaps_windows_amd64.exe` and its `.sha256` checksum
+- `golaps_v<version>.pkg` (`golaps`, `mac_helper`, and `golaps_auth`, packaged with `pkgbuild`)
+
+For signed production releases, set `CODESIGN_IDENTITY`, `INSTALLER_IDENTITY`, and `GOLAPS_VERSION` before you run `build.sh`.
 
 ## GitHub Actions
 
@@ -26,7 +27,7 @@ To build from GitHub:
 4. Click **Run workflow**.
 5. Download the uploaded build artifacts.
 
-The workflow builds:
+The workflow builds these binaries:
 
 - `golaps_darwin_arm64`
 - `golaps_darwin_amd64`

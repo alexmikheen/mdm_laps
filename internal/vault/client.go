@@ -1,33 +1,59 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
-// internal/vault/client.go
 package vault
 
 import "context"
 
-// PendingPasswordFieldID holds a password that has been generated but not yet confirmed applied to the device. See Client.StagePendingPassword.
-const PendingPasswordFieldID = "field_pending_password"
+const (
+	PendingPasswordFieldID = "field_pending_password"
+	PreviousPendingFieldID = "field_previous_pending"
+	BridgePasswordFieldID  = "field_bridge_password"
+)
 
 type Credentials struct {
 	ItemID      string
 	OldLogin    string
 	OldPassword string
-	// PendingPassword is a staged password left behind by a run that did not reach its confirming write. It may or may not be the one the device actually holds — treat it as a recovery candidate, never as the known-good password.
+	// PendingPassword holds a staged candidate from an incomplete run.
 	PendingPassword string
-	LegacyLogin     string
-	LegacyPassword  string
-	IsMigration     bool
+	// PreviousPendingPassword holds the pending value displaced by the latest stage.
+	PreviousPendingPassword string
+	// BridgePassword holds the temporary bridge admin password when a bridge exists.
+	BridgePassword string
+	LegacyLogin    string
+	LegacyPassword string
+	IsMigration    bool
+}
+
+func (creds *Credentials) recordConfirmed(login, password string) {
+	if creds.IsMigration {
+		creds.LegacyLogin = creds.OldLogin
+		creds.LegacyPassword = creds.OldPassword
+		creds.IsMigration = false
+	}
+	creds.OldLogin = login
+	creds.OldPassword = password
+	creds.PendingPassword = ""
+	creds.PreviousPendingPassword = ""
 }
 
 type Client interface {
 	GetCredentials(ctx context.Context, deviceID, vaultID, targetAdmin string) (*Credentials, error)
 
-	// StagePendingPassword escrows the candidate password BEFORE it is applied to the device, and records the resulting item ID in creds. Rotation is irreversible and the vault is the only copy: if the vault write is attempted only after the OS password has changed and that write fails, the working password is gone and the account is unreachable. Staging first also proves the service account still has write access before anything irreversible happens. UpsertCredentials clears the staged field once the real password is committed. A backend that cannot stage must return an error here — never a silent no-op — so the orchestrator aborts before touching the device.
+	// StagePendingPassword stores the candidate password before the OS rotation and updates creds.ItemID.
 	StagePendingPassword(ctx context.Context, creds *Credentials, deviceID, hostname, vaultID, newLogin, newPassword string) error
+
+	// ConfirmLivePassword promotes a device-verified candidate to the active password and clears pending fields.
+	ConfirmLivePassword(ctx context.Context, creds *Credentials, deviceID, hostname, vaultID, login, live string) error
 
 	UpsertCredentials(ctx context.Context, creds *Credentials, deviceID, hostname, vaultID, newLogin, newPassword, tokenStatus string) error
 
-	// ClearPendingPassword removes the staged field from the item. Only safe when the staged password provably never reached the device (a policy-rejected rotation): leaving it would make the next run try a known-refused password as the current one.
+	// ClearPendingPassword removes the staged password and restores any previous pending value.
 	ClearPendingPassword(ctx context.Context, creds *Credentials, vaultID string) error
+
+	// StageBridgePassword stores the bridge admin password before GoLAPS creates the bridge account.
+	StageBridgePassword(ctx context.Context, creds *Credentials, vaultID, password string) error
+
+	ClearBridgePassword(ctx context.Context, creds *Credentials, vaultID string) error
 }

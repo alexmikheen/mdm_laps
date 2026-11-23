@@ -1,14 +1,15 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
-// internal/notify/slack.go
 package notify
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -82,8 +83,14 @@ func (s *SlackNotifier) SendPasswordRotation(hostname, serial, adminUser, status
 		return fmt.Errorf("failed to marshal slack message: %w", err)
 	}
 
-	resp, err := http.Post(s.webhookURL, "application/json", bytes.NewBuffer(payload))
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Post(s.webhookURL, "application/json", bytes.NewBuffer(payload))
 	if err != nil {
+		// Unwrap *url.Error so the secret webhook URL is never leaked into logs or error reports.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			return fmt.Errorf("failed to send slack notification: %w", urlErr.Err)
+		}
 		return fmt.Errorf("failed to send slack notification: %w", err)
 	}
 	defer resp.Body.Close()

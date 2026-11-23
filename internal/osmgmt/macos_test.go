@@ -1,5 +1,5 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 //go:build darwin
 
@@ -14,7 +14,6 @@ import (
 	"testing"
 )
 
-// The distinction this test protects: "macOS said DISABLED" must be separable from "macOS did not answer". Collapsing the two is what let a timed-out status check delete a healthy admin account, because an empty answer read as "this account has no Secure Token".
 func TestParseSecureTokenStatus(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -24,16 +23,16 @@ func TestParseSecureTokenStatus(t *testing.T) {
 	}{
 		{
 			name:        "enabled",
-			output:      "2025-01-01 10:00:00 sysadminctl[551:9999] Secure token is ENABLED for user lapsadmin",
+			output:      "2026-08-11 10:00:00 sysadminctl[551:9999] Secure token is ENABLED for user localadmin",
 			wantEnabled: true, wantOK: true,
 		},
 		{
 			name:        "disabled",
-			output:      "2025-01-01 10:00:00 sysadminctl[551:9999] Secure token is DISABLED for user lapsadmin",
+			output:      "2026-08-11 10:00:00 sysadminctl[551:9999] Secure token is DISABLED for user localadmin",
 			wantEnabled: false, wantOK: true,
 		},
-		{name: "ON wording", output: "Secure token is ON for user lapsadmin", wantEnabled: true, wantOK: true},
-		{name: "OFF wording", output: "Secure token is OFF for user lapsadmin", wantEnabled: false, wantOK: true},
+		{name: "ON wording", output: "Secure token is ON for user localadmin", wantEnabled: true, wantOK: true},
+		{name: "OFF wording", output: "Secure token is OFF for user localadmin", wantEnabled: false, wantOK: true},
 		{name: "empty output is not an answer", output: "", wantEnabled: false, wantOK: false},
 		{
 			name:        "unrelated error is not an answer",
@@ -57,9 +56,8 @@ func TestParseSecureTokenStatus(t *testing.T) {
 	}
 }
 
-// A "DISABLED" substring must never be read as enabled: this account list decides whether laps_token.sh deletes laps-bridge, the last crypto-recovery account on the machine.
 func TestParseSecureTokenStatusDoesNotConfuseDisabledWithEnabled(t *testing.T) {
-	enabled, ok := parseSecureTokenStatus("Secure token is DISABLED for user lapsadmin")
+	enabled, ok := parseSecureTokenStatus("Secure token is DISABLED for user localadmin")
 	if !ok {
 		t.Fatal("DISABLED should be a definite answer")
 	}
@@ -71,8 +69,8 @@ func TestParseSecureTokenStatusDoesNotConfuseDisabledWithEnabled(t *testing.T) {
 func TestParseLocalUsers(t *testing.T) {
 	const dsclOutput = `_amavisd                                         83
 _appleevents                                     55
-jappleseed                                       501
-lapsadmin                                            502
+jdoe                                       501
+localadmin                                            502
 laps-bridge                                           503
 root                                             0
 daemon                                           1
@@ -82,7 +80,7 @@ weird                                            notanumber
 `
 
 	got := parseLocalUsers(dsclOutput)
-	want := []string{"jappleseed", "lapsadmin", "laps-bridge"}
+	want := []string{"jdoe", "localadmin", "laps-bridge"}
 
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("parseLocalUsers() = %v, want %v", got, want)
@@ -95,10 +93,9 @@ func TestParseLocalUsersEmpty(t *testing.T) {
 	}
 }
 
-// The MDM legacy password belongs to a service admin. Offering it to a human account cannot succeed and only fills the log with -14090 noise that reads like a rights problem.
 func TestIsServiceAccount(t *testing.T) {
 	creds := map[string]string{
-		"lapsadmin":         "pw",
+		"localadmin":             "pw",
 		"MDM_FALLBACK_PASS": "legacy",
 	}
 
@@ -107,32 +104,31 @@ func TestIsServiceAccount(t *testing.T) {
 		login string
 		want  bool
 	}{
-		{name: "the target admin itself", login: "lapsadmin", want: true},
+		{name: "the target admin itself", login: "localadmin", want: true},
 		{name: "the legacy service admin", login: "laps-bridge", want: true},
 		{name: "an account we hold a vault credential for", login: "MDM_FALLBACK_PASS", want: true},
-		{name: "a human account", login: "jappleseed", want: false},
+		{name: "a human account", login: "jdoe", want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isServiceAccount(tt.login, "lapsadmin", creds); got != tt.want {
+			if got := isServiceAccount(tt.login, "localadmin", creds); got != tt.want {
 				t.Errorf("isServiceAccount(%q) = %v, want %v", tt.login, got, tt.want)
 			}
 		})
 	}
 }
 
-// Helper output is logged on the success path now, so every secret the payload carried must be scrubbed from it first: the helper's own lines are safe, but sysadminctl writes to the same stderr and OpenDirectory error descriptions are opaque strings.
 func TestRedactSecretsMasksEveryPayloadSecret(t *testing.T) {
 	p := SwiftPayload{
 		Action:     "change_password",
-		TargetUser: "lapsadmin",
+		TargetUser: "localadmin",
 		TargetPass: "NewPass-123",
 		OldPass:    "LegacyPass-456",
 		AdminPass:  "AdminPass-789",
 	}
 
-	in := "[SWIFT] error: NewPass-123 LegacyPass-456 AdminPass-789 for lapsadmin"
+	in := "[SWIFT] error: NewPass-123 LegacyPass-456 AdminPass-789 for localadmin"
 	got := redactSecrets(in, p.secrets())
 
 	for _, secret := range []string{"NewPass-123", "LegacyPass-456", "AdminPass-789"} {
@@ -140,7 +136,7 @@ func TestRedactSecretsMasksEveryPayloadSecret(t *testing.T) {
 			t.Errorf("redacted output still contains secret %q: %s", secret, got)
 		}
 	}
-	if !strings.Contains(got, "lapsadmin") {
+	if !strings.Contains(got, "localadmin") {
 		t.Errorf("redaction must keep non-secret content (account name): %s", got)
 	}
 	if !strings.Contains(got, "[REDACTED]") {
@@ -148,21 +144,19 @@ func TestRedactSecretsMasksEveryPayloadSecret(t *testing.T) {
 	}
 }
 
-// An empty secret must never reach strings.ReplaceAll — replacing "" inserts the marker between every character of the output. Payloads legitimately carry empty fields (verify_password has no OldPass or AdminPass), so secrets() has to drop them.
 func TestSecretsSkipsEmptyFields(t *testing.T) {
-	p := SwiftPayload{Action: "verify_password", TargetUser: "jappleseed", TargetPass: "OnlyOne"}
+	p := SwiftPayload{Action: "verify_password", TargetUser: "jdoe", TargetPass: "OnlyOne"}
 
 	got := p.secrets()
 	if !reflect.DeepEqual(got, []string{"OnlyOne"}) {
 		t.Errorf("secrets() = %v, want [OnlyOne]", got)
 	}
 
-	if out := redactSecrets("[SWIFT] User jappleseed not found", p.secrets()); strings.Contains(out, "[REDACTED][REDACTED]") {
+	if out := redactSecrets("[SWIFT] User jdoe not found", p.secrets()); strings.Contains(out, "[REDACTED][REDACTED]") {
 		t.Errorf("empty-string secret corrupted the output: %s", out)
 	}
 }
 
-// The helper's exit codes ARE the contract between the two languages: Go reads them to decide whether to escalate a token holder to recreation. Nothing at build time links the Swift enum to the Go constants, so reordering the Swift cases would silently turn "locked" into "auth-failed" — or worse, "ok". This test parses the helper and asserts the numbers still line up.
 func TestChangeOutcomeValuesMatchSwiftHelper(t *testing.T) {
 	src, err := os.ReadFile("mac_helper.swift")
 	if err != nil {
@@ -197,7 +191,6 @@ func TestChangeOutcomeValuesMatchSwiftHelper(t *testing.T) {
 }
 
 func TestChangeOutcomeString(t *testing.T) {
-	// The label reaches the MDM log and is how an operator tells "the password is wrong" apart from "opendirectoryd refused the reset" — two states that used to look identical.
 	for outcome, want := range map[changeOutcome]string{
 		changeOK:           "ok",
 		changeODError:      "od-error",
@@ -208,6 +201,34 @@ func TestChangeOutcomeString(t *testing.T) {
 	} {
 		if got := outcome.String(); got != want {
 			t.Errorf("changeOutcome(%d).String() = %q, want %q", int(outcome), got, want)
+		}
+	}
+}
+
+func TestParseMacSerialRejectsPlaceholders(t *testing.T) {
+	for _, bad := range []string{
+		"",
+		`"IOPlatformUUID" = "ABC"`,
+		`"IOPlatformSerialNumber" = ""`,
+		`"IOPlatformSerialNumber" = "Unknown"`,
+		`"IOPlatformSerialNumber" = "unknown"`,
+		`"IOPlatformSerialNumber" = "   "`,
+		`"IOPlatformSerialNumber" = "abc123"`,
+		`"IOPlatformSerialNumber" = "D3936T0L7X extra"`,
+		`"IOPlatformSerialNumber" = "ABCDEFGHIJKLMNOPQRSTU"`,
+	} {
+		if got, err := parseMacSerial(bad); err == nil {
+			t.Fatalf("parseMacSerial(%q) = %q, want an error", bad, got)
+		}
+	}
+	for _, good := range []string{"D3936T0L7X", "C02TEST00001", "C02ZW1ABMD6T", "C02TEST00002"} {
+		out := "    |   \"IOPlatformSerialNumber\" = \"" + good + "\"\n"
+		got, err := parseMacSerial(out)
+		if err != nil {
+			t.Fatalf("parseMacSerial for %s: %v", good, err)
+		}
+		if got != good {
+			t.Fatalf("parseMacSerial = %q, want %q", got, good)
 		}
 	}
 }

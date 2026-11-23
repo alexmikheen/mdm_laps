@@ -1,6 +1,6 @@
 # Configuration
 
-GoLAPS can be configured with environment variables and, on macOS, managed preferences under the `io.github.golaps` domain.
+You can configure GoLAPS with environment variables and, on macOS, managed preferences under the `io.github.golaps` domain.
 
 ## Common Settings
 
@@ -19,22 +19,18 @@ Supported `LAPS_VAULT_TYPE` values:
 - `aws`
 - `azure`
 
-`LAPS_VAULT_TOKEN` is a generic token alias for providers that authenticate with a single token. Provider-specific variables still work.
+`LAPS_VAULT_TOKEN` is a generic token alias for single-token providers. Provider-specific variables still work.
 
-Optional settings:
+For MDM deployments, pass secrets over `stdin` with `--secrets-from-stdin` (line 1: vault token, line 2: optional `LEGACY_ADMIN_PASS`). That keeps secrets out of `ps` and process environments.
+
+Optional migration setting:
 
 ```bash
-# Help link offered by the macOS GUI dialogs (IT portal / rollout announcement).
-# When unset, the dialogs simply omit their help button.
-export LAPS_SUPPORT_URL="https://support.example.com/laps"
-
-# Password of a legacy admin account from a previous deployment, used as the
-# last-resort rotation candidate during migration.
+# Password of a legacy admin account from a previous deployment, used as the last-resort rotation candidate during migration.
 export LEGACY_ADMIN_PASS="previous-admin-password"
 ```
 
-On macOS, runs are also logged to `/Library/Logs/golaps.log` (tail-capped at 2000 lines). Most MDMs
-keep only the latest run per device, so this local file is the only run history that survives.
+On macOS, GoLAPS also logs runs to `/Library/Logs/golaps.log` and caps the file at 2000 lines. Most MDMs keep only the latest run per device, so this local file preserves run history.
 
 ## 1Password
 
@@ -43,13 +39,13 @@ export LAPS_VAULT_TYPE="onepassword"
 export LAPS_VAULT_TOKEN="your-service-account-token"
 ```
 
-Alternative:
+Alternative variable:
 
 ```bash
 export OP_SERVICE_ACCOUNT_TOKEN="your-service-account-token"
 ```
 
-On macOS, the token can also be stored in the System Keychain with the label `GoLAPS_Vault_Token`.
+On macOS, GoLAPS can also read the token from the System Keychain under the label `GoLAPS_Vault_Token` and then delete it.
 
 ## HashiCorp Vault
 
@@ -60,7 +56,7 @@ export LAPS_VAULT_TOKEN="your-vault-token"
 export LAPS_VAULT_PATH="secret/data/laps"
 ```
 
-Alternative:
+Alternative variable:
 
 ```bash
 export VAULT_TOKEN="your-vault-token"
@@ -68,11 +64,15 @@ export VAULT_TOKEN="your-vault-token"
 
 ## Bitwarden Secrets Manager
 
+Build GoLAPS with CGO and the `bitwarden_sdk` build tag (`CGO_ENABLED=1 go build -tags=bitwarden_sdk`), then set:
+
 ```bash
 export LAPS_VAULT_TYPE="bitwarden"
-export BW_SERVER_URL="https://api.bitwarden.com"
-export BW_API_KEY="client_id:client_secret"
-export BW_ORG_ID="your-organization-id"
+export BWS_ACCESS_TOKEN="your-machine-account-token"
+export LAPS_VAULT_ID="your-bitwarden-project-id"
+# Optional for self-hosted Bitwarden instances:
+export BWS_API_URL="https://api.bitwarden.com"
+export BWS_IDENTITY_URL="https://identity.bitwarden.com"
 ```
 
 ## AWS Secrets Manager
@@ -81,9 +81,11 @@ export BW_ORG_ID="your-organization-id"
 export LAPS_VAULT_TYPE="aws"
 export AWS_REGION="us-east-1"
 export AWS_PROFILE="default"
+# Optional for VPC endpoints, LocalStack, or Moto:
+export AWS_ENDPOINT_URL="https://secretsmanager.example.internal"
 ```
 
-AWS credentials are loaded through the default AWS SDK credential chain.
+GoLAPS loads AWS credentials through the default AWS SDK v2 credential chain.
 
 ## Azure Key Vault
 

@@ -1,7 +1,6 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
-// internal/osmgmt/manager.go
 package osmgmt
 
 import (
@@ -9,20 +8,43 @@ import (
 	"errors"
 )
 
-// ErrPolicyRejected marks a rotation whose NEW password was refused by the device's password policy: the staged copy in the vault was provably never applied, so the orchestrator can safely clear it — otherwise the next run tries the refused value as the current password and escalates a healthy account to recreation.
+// ErrPolicyRejected signals that the device password policy refused the new password.
 var ErrPolicyRejected = errors.New("the new password was rejected by the device's password policy")
 
-// TokenStatusDisabledPrefix prefixes every ManageSecureToken result meaning the service account still holds no Secure Token, i.e. it cannot unlock FileVault. Callers must treat such a run as a failure: reporting success here is what lets devices end up silently unrecoverable while the MDM job shows "Pass".
-const TokenStatusDisabledPrefix = "DISABLED"
+const (
+	TokenStatusDisabledPrefix        = "DISABLED"
+	// TokenStatusDisabledCovered reports no Secure Token while a local PRK and escrowed bootstrap token exist.
+	TokenStatusDisabledCovered       = TokenStatusDisabledPrefix + " (MDM recovery covered)"
+	TokenStatusDisabledWrongPassword = TokenStatusDisabledPrefix + " (wrong password streak)"
+	TokenStatusDisabledWindowKilled  = TokenStatusDisabledPrefix + " (window ended early)"
+	// TokenStatusDisabledDeadlock reports that only laps-bridge holds a Secure Token and no stored password fits it.
+	TokenStatusDisabledDeadlock      = TokenStatusDisabledPrefix + " (bridge deadlock)"
+)
 
-// TokenStatusDisabledCovered is the one DISABLED outcome that reports as a warning instead of a failure: the account holds no token, but a personal recovery key exists LOCALLY and the bootstrap token is escrowed. Coverage changes only how the failed grant reports — the GUI prompt still runs on every check-in until the token lands, and the local PRK check cannot prove the MDM actually holds the key, so rollout monitoring should cross-check escrow via the MDM's reporting.
-const TokenStatusDisabledCovered = TokenStatusDisabledPrefix + " (MDM recovery covered)"
+// ErrSkipRun ends a preflight check cleanly with exit code 0.
+var ErrSkipRun = errors.New("run skipped by preflight")
 
-// Every method takes the run context so the whole process shares one deadline. MDM platforms commonly hard-kill a custom script around 60 minutes; main() sets a deadline below that and every sub-operation derives its own timeout from it. Previously each function built its own context.Background(), so the "budget" the GUI path claimed to respect only started counting when the GUI path began — the vault list, the rotation and the token-holder scan before it were free, and the run could still be hard-killed mid-vault-write.
+// ErrConflict stops the run when another process locks the account or repeats account recreation.
+var ErrConflict = errors.New("[CONFLICT]")
+
+// ErrNoTokenHolder stops account recreation when no local account holds a Secure Token.
+var ErrNoTokenHolder = errors.New("[NO TOKEN HOLDER]")
+
+const LegacyBridgeAdmin = "laps-bridge"
+
+// BridgeEscrow stores the bridge admin password in the vault before GoLAPS creates the account.
+type BridgeEscrow func(ctx context.Context, password string) error
+
 type Manager interface {
-	GetSystemInfo(ctx context.Context) (hostname, serial string)
-	// altOldPass is the second authentication candidate (typically the recorded password when the vault's staged pending copy went first). Tried once when oldPass fails to authenticate, BEFORE escalating to recreation — recreation costs the Secure Token and a user prompt.
-	EnsureUserAndChangePassword(ctx context.Context, user, oldPass, altOldPass, newPass string) error
+	// Preflight runs safety checks and soft account repairs before GoLAPS accesses the vault.
+	Preflight(ctx context.Context, user, probeURL string) error
+	GetSystemInfo(ctx context.Context) (hostname, serial string, err error)
+	EnsureUserAndChangePassword(ctx context.Context, user string, candidates []string, newPass string) error
+	// VerifyPassword checks whether pass is the live password of user, or returns errors.ErrUnsupported.
+	VerifyPassword(ctx context.Context, user, pass string) (ok bool, err error)
 	ManageSecureToken(ctx context.Context, targetUser, newPass string, availableCreds map[string]string) string
+	// CleanupLegacyAdmin deletes laps-bridge once targetUser holds a Secure Token and returns true if absent.
+	CleanupLegacyAdmin(ctx context.Context, targetUser string) (absent bool)
+	SetBridgeEscrow(escrow BridgeEscrow)
 	DeleteServiceAccountToken(ctx context.Context) error
 }

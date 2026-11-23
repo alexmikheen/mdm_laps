@@ -1,5 +1,5 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 package vault
 
@@ -39,7 +39,6 @@ func TestPickNewestMatch(t *testing.T) {
 			serial: "SERIAL1", wantID: "a", wantMatches: 1,
 		},
 		{
-			// Observed in production: a single serial can accumulate several items with different passwords. Taking the first match can hand back a months-old password.
 			name: "duplicates: newest wins even when it is last",
 			items: []onepassword.ItemOverview{
 				overview("stale", "SERIAL1", day(1)),
@@ -89,7 +88,6 @@ func TestPickNewestMatch(t *testing.T) {
 	}
 }
 
-// A duplicate count above 1 is what triggers the operator warning, so it has to be the number of items sharing the serial — not the total scanned, and not just "more than one exists".
 func TestPickNewestMatchCountsOnlyMatchingItems(t *testing.T) {
 	items := []onepassword.ItemOverview{
 		overview("a", "SERIAL1", day(1)),
@@ -132,7 +130,6 @@ func TestSetFieldAppendsWhenAbsent(t *testing.T) {
 	}
 }
 
-// The staged password must be gone once the real password field carries it, otherwise every record keeps a second, unmarked copy of a live credential.
 func TestRemoveFieldDropsOnlyTheNamedField(t *testing.T) {
 	fields := []onepassword.ItemField{
 		{ID: "field_login", Value: "lapsadmin"},
@@ -193,7 +190,6 @@ func TestApplyRotatedFieldsPreservesLegacyOnlyOnce(t *testing.T) {
 		t.Fatalf("legacy_password_oldadmin = %q, want old-legacy-pass", v)
 	}
 
-	// A second rotation must not overwrite the preserved legacy secret with a newer value.
 	got = applyRotatedFields(got, &Credentials{IsMigration: true, OldLogin: "oldadmin", OldPassword: "different"}, "lapsadmin", "newer", "ENABLED", "Host")
 	if v, _ := fieldValue(got, "legacy_password_oldadmin"); v != "old-legacy-pass" {
 		t.Fatalf("legacy_password_oldadmin after second rotation = %q, want old-legacy-pass", v)
@@ -201,7 +197,6 @@ func TestApplyRotatedFieldsPreservesLegacyOnlyOnce(t *testing.T) {
 }
 
 func TestIsNetworkErrorMatchesObservedFailures(t *testing.T) {
-	// Both strings mirror failures observed verbatim in production logs.
 	network := fmt.Errorf("listing the LAPS vault failed after 3 attempts: context deadline exceeded (recovered by wazero)")
 	if !IsNetworkError(network) {
 		t.Fatalf("wazero deadline error must classify as network")
@@ -213,7 +208,6 @@ func TestIsNetworkErrorMatchesObservedFailures(t *testing.T) {
 	if IsNetworkError(conflict) {
 		t.Fatalf("an item version conflict is a logic condition, not a network failure")
 	}
-	// Mirrors production failures where the final attempt's error carried these strings and the [NETWORK] marker was missed.
 	for _, msg := range []string{
 		"listing the LAPS vault failed after 3 attempts: Get \"https://my.1password.com/...\": dial tcp [2600::1]:443: connect: no route to host (recovered by wazero)",
 		"read tcp 192.0.2.10:56782->198.51.100.20:443: read: operation timed out (recovered by wazero)",

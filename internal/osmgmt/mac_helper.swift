@@ -1,8 +1,10 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 import Foundation
 import OpenDirectory
+
+signal(SIGPIPE, SIG_IGN)
 
 struct LapsPayload: Codable {
     let action: String
@@ -11,7 +13,7 @@ struct LapsPayload: Codable {
     let oldPass: String?
     let adminUser: String?
     let adminPass: String?
-    // Set by Go only for token-less accounts. Absent means false — a payload from an older binary must not be able to trigger a reset that could break a FileVault chain.
+    // Go sets this true only for accounts without a Secure Token.
     let allowAdminReset: Bool?
 }
 
@@ -20,23 +22,20 @@ func readStdin() -> LapsPayload? {
     return try? JSONDecoder().decode(LapsPayload.self, from: data)
 }
 
-// ============================================================================== 1. ADMINISTRATIVE RESET ==============================================================================
-
-// ResetOutcome separates "sysadminctl performed the reset" from "sysadminctl exited 0 while opendirectoryd refused it" — the phantom that escrowed passwords the machine never received (observed in production).
+// ResetOutcome distinguishes a real reset from a phantom reset (exit 0 while opendirectoryd refuses).
 enum ResetOutcome {
     case ok
     case refused
     case failed
 }
 
-// Markers sysadminctl prints while still exiting 0. Detection is by OUTPUT on purpose: verifying by re-authenticating is what v1.1.15 did, and every failed attempt spent an authentication against the account. None of these strings appear in a successful reset — the "will not allow user to use FDE" notice sysadminctl always prints does not match any of them.
+// sysadminctl can exit 0 while printing one of these refusal strings.
 let resetRefusalMarkers = [
     "Operation is not permitted without secure token unlock",
     "not permitted",
     "Could not set password",
 ]
 
-// stdin only, no argv fallback: production logs showed the direct-arguments fallback firing repeatedly without a single success, so it only ever put the password into an argument list.
 func administrativeResetSecure(user: String, newPass: String) -> ResetOutcome {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/sbin/sysadminctl")
@@ -49,13 +48,12 @@ func administrativeResetSecure(user: String, newPass: String) -> ResetOutcome {
     do {
         try task.run()
         if let passData = (newPass + "\n").data(using: .utf8) {
-            inPipe.fileHandleForWriting.write(passData)
+            try? inPipe.fileHandleForWriting.write(contentsOf: passData)
         }
-        inPipe.fileHandleForWriting.closeFile()
+        try? inPipe.fileHandleForWriting.close()
         let data = outPipe.fileHandleForReading.readDataToEndOfFile()
         task.waitUntilExit()
         let output = String(data: data, encoding: .utf8) ?? ""
-        // Capturing the pipe means this output no longer reaches the Go log on its own, and it is the only evidence of a refusal — so re-emit it. The Go side scrubs it through redactSecrets before logging.
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
             fputs("[SWIFT] sysadminctl -resetPasswordFor output: \(trimmed)\n", stderr)
@@ -67,9 +65,6 @@ func administrativeResetSecure(user: String, newPass: String) -> ResetOutcome {
     } catch { return .failed }
 }
 
-// ============================================================================== 2. NATIVE OPENDIRECTORY ROTATION ==============================================================================
-
-// localUserRecord looks up a local account in OpenDirectory.
 func localUserRecord(user: String) throws -> ODRecord? {
     let node = try ODNode(session: .default(), type: ODNodeType(kODNodeTypeLocalNodes))
     let query = try ODQuery(
@@ -101,7 +96,7 @@ func verifyPasswordNative(user: String, pass: String) -> Bool {
     }
 }
 
-// ChangeOutcome is this helper's exit code for `change_password`. The helper reports WHAT happened; the Go side owns the policy decision, because only it knows whether the account holds a Secure Token and whether recreation is acceptable.
+// Exit codes for change_password; Go mirrors these raw values in macos.go.
 enum ChangeOutcome: Int32 {
     case ok = 0
     case odError = 1
@@ -122,11 +117,14 @@ enum ChangeOutcome: Int32 {
     }
 }
 
+let odErrorAccountTemporarilyLocked = 5304
 let odErrorAccountLocked = 5305
-// 5402...5407 all mean the NEW password (or its timing) failed the device's password policy: 5402 quality, 5403 too short, 5404 too long, 5405 needs letter, 5406 needs digit, 5407 change too soon. The account is healthy — reporting any of these as auth-failed made Go recreate a working admin over a rejected new password (observed in production).
+// OpenDirectory 5402-5407: password policy rejected the new password.
 let odErrorPolicyViolations: ClosedRange<Int> = 5402...5407
+// OpenDirectory 5200-5205: transient server or transport errors.
+let odErrorServerTransport: ClosedRange<Int> = 5200...5205
 
-// changePasswordNative rotates the password and reports the outcome. It NEVER decides on its own to fall back to an administrative reset: for an account that holds a Secure Token that reset either reports a phantom success or silently breaks the SEP/FileVault chain, and this process cannot know the token state or what the caller wants done about it. allowAdminReset therefore comes from Go, which sets it only for token-less accounts (nothing left to break). It defaults to false at the call site: fail-safe, so a payload from an older binary cannot trigger a risky reset.
+// changePasswordNative rotates the password and only falls back to sysadminctl when Go sets allowAdminReset.
 func changePasswordNative(user: String, oldPass: String?, newPass: String, allowAdminReset: Bool) -> ChangeOutcome {
     var record: ODRecord?
     do {
@@ -149,13 +147,14 @@ func changePasswordNative(user: String, oldPass: String?, newPass: String, allow
             let code = (error as NSError).code
             let outcome: ChangeOutcome
             switch code {
-            case odErrorAccountLocked: outcome = .locked
+            case odErrorAccountTemporarilyLocked, odErrorAccountLocked: outcome = .locked
             case odErrorPolicyViolations: outcome = .policyRejected
-            default: outcome = .authFailed
+            case odErrorServerTransport: outcome = .odError
+            case 5000, 5101, 5300...5303, 5400, 5401: outcome = .authFailed
+            default: outcome = .odError
             }
             fputs("[SWIFT] Authenticated change failed for \(user) (OpenDirectory code \(code), reporting \(outcome.label)): \(error)\n", stderr)
             if outcome == .policyRejected {
-                // An administrative reset submits the SAME rejected password to the SAME policy — it cannot help, and against a token holder it is the phantom-reset risk. Bail out for both callers.
                 fputs("[SWIFT] The new password itself was rejected by the password policy; no reset can apply it. Reporting \(outcome.label) so the caller retries with a different password.\n", stderr)
                 return outcome
             }
@@ -184,9 +183,6 @@ func changePasswordNative(user: String, oldPass: String?, newPass: String, allow
     }
 }
 
-// ============================================================================== 3. SECURE TOKEN GRANT ==============================================================================
-
-// stdin only, no argv fallback — same fleet evidence as the administrative reset above.
 func grantSecureTokenSecure(targetUser: String, targetPass: String, adminUser: String, adminPass: String) -> Bool {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/sbin/sysadminctl")
@@ -196,19 +192,19 @@ func grantSecureTokenSecure(targetUser: String, targetPass: String, adminUser: S
     do {
         try task.run()
         if let adminData = (adminPass + "\n").data(using: .utf8) {
-            inPipe.fileHandleForWriting.write(adminData)
+            try? inPipe.fileHandleForWriting.write(contentsOf: adminData)
         }
         Thread.sleep(forTimeInterval: 0.5)
         if let targetData = (targetPass + "\n").data(using: .utf8) {
-            inPipe.fileHandleForWriting.write(targetData)
+            try? inPipe.fileHandleForWriting.write(contentsOf: targetData)
         }
-        inPipe.fileHandleForWriting.closeFile()
+        try? inPipe.fileHandleForWriting.close()
         task.waitUntilExit()
         return task.terminationStatus == 0
     } catch { return false }
 }
 
-// secureTokenIsEnabled asks macOS for the real token state. This exists because `sysadminctl` exits 0 even when opendirectoryd refused the operation outright — observed in the unified log as "Failed to enable SEP credential: Credential is not an admin" / ODErrorCredentialsNotAuthorized (error 5101) beside a process that still returned status 0. Trusting the exit code therefore reported a phantom success.
+// sysadminctl can exit 0 even when opendirectoryd refuses the grant, so verify the token state explicitly.
 func secureTokenIsEnabled(user: String) -> Bool {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/sbin/sysadminctl")
@@ -221,14 +217,14 @@ func secureTokenIsEnabled(user: String) -> Bool {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         task.waitUntilExit()
         let output = String(data: data, encoding: .utf8) ?? ""
-        // Match the whole phrase — a bare "ENABLED" test is one typo from matching "DISABLED".
+ // Match the whole phrase. A bare "ENABLED" test is one typo away from a match on "DISABLED".
         return output.contains("is ENABLED") || output.contains("is ON")
     } catch { return false }
 }
 
 func grantSecureToken(targetUser: String, targetPass: String, adminUser: String, adminPass: String) -> Bool {
     if grantSecureTokenSecure(targetUser: targetUser, targetPass: targetPass, adminUser: adminUser, adminPass: adminPass) {
-        Thread.sleep(forTimeInterval: 1.0) // let opendirectoryd commit the SEP credential
+        Thread.sleep(forTimeInterval: 1.0) // give opendirectoryd time to commit the SEP credential
         if secureTokenIsEnabled(user: targetUser) {
             fputs("[SWIFT] Token granted securely via stdin.\n", stdout)
             return true
@@ -240,7 +236,9 @@ func grantSecureToken(targetUser: String, targetPass: String, adminUser: String,
     return false
 }
 
-// ============================================================================== MAIN EXECUTION ==============================================================================
+// ==============================================================================
+// MAIN EXECUTION
+// ==============================================================================
 
 guard let payload = readStdin() else {
     fputs("[SWIFT] Invalid JSON payload received from standard input.\n", stderr)

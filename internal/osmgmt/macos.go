@@ -1,5 +1,5 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 //go:build darwin
 
@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -22,25 +21,18 @@ import (
 	"golaps/internal/version"
 )
 
-// supportURL returns the optional help link surfaced by the user-facing dialogs (env LAPS_SUPPORT_URL, e.g. your IT portal or the rollout announcement). Empty means the dialogs simply omit their help button.
-func supportURL() string {
-	return strings.TrimSpace(os.Getenv("LAPS_SUPPORT_URL"))
-}
+const teamITChannelURL = ""
 
-// Admin By Request client. The adminbyrequest:// URL scheme only activates the app (it carries no verbs — verified in the 5.2.2 binary), so it does NOT raise the "start an administrator session?" prompt. Relaunching the single-instance app with `open -a` is what surfaces that prompt, so we drive the app by name, not by URL.
+// Use open -a to activate Admin By Request; its URL scheme does not open the elevation prompt.
 const (
 	abrAppPath = "/Applications/Admin By Request.app"
 	abrAppName = "Admin By Request"
 
-	// abrWaitWindow: how long we wait for the user to obtain admin rights via Admin By Request. An approved session shows up within ~10s of the user clicking, so this is only the walked-away ceiling. Deliberately short: a longer window parks the device's MDM script slot for the better part of an hour on a Mac whose user may never have seen the dialog, and the whole grant is retried on the next check-in anyway.
-	abrWaitWindow = 15 * time.Minute
-	// abrPollInterval bounds the pause between "AbR approved the session" and the password dialog appearing. dseditgroup -o checkmember is an instant local lookup, so polling every 2s costs nothing and cuts the perceived lag from up to 10s to up to 2s.
 	abrPollInterval = 2 * time.Second
 
-	// vaultWriteReserve is the slice of the run budget that no GUI interaction may eat into, so the vault write still fits after the token path gives up. Without it a dialog waiting on a human can push the run past the MDM's 60-minute kill and lose the rotated password entirely.
+	// Reserve time for the final vault write so GUI prompts cannot push the run past the MDM timeout.
 	vaultWriteReserve = 5 * time.Minute
 
-	// dialogWait caps a single user-facing dialog (a human has to read and click).
 	dialogWait = 5 * time.Minute
 )
 
@@ -51,11 +43,11 @@ type SwiftPayload struct {
 	OldPass    string `json:"oldPass,omitempty"`
 	AdminUser  string `json:"adminUser,omitempty"`
 	AdminPass  string `json:"adminPass,omitempty"`
-	// AllowAdminReset permits the helper's administrative reset. Set it ONLY for a token-less account: on a token holder that reset either reports a phantom success (sysadminctl exits 0 while opendirectoryd refuses) or silently breaks the SEP/FileVault chain, so the policy call belongs here, where the token state is known.
+	// Set AllowAdminReset true only for accounts without a Secure Token.
 	AllowAdminReset bool `json:"allowAdminReset,omitempty"`
 }
 
-// changeOutcome mirrors ChangeOutcome in mac_helper.swift. The helper reports the failure CLASS; this side decides what to do about it.
+// changeOutcome mirrors ChangeOutcome in mac_helper.swift.
 type changeOutcome int
 
 const (
@@ -64,7 +56,7 @@ const (
 	changeAuthFailed   changeOutcome = 2
 	changeLocked       changeOutcome = 3
 	changeResetRefused changeOutcome = 4
-	// changePolicyRejected: OD 5402-5407 — the NEW password (or its timing) failed the device's password policy. The account is fine; recreating it cannot help and only churns a healthy admin.
+	// OD 5402-5407: device password policy rejected the new password; do not recreate.
 	changePolicyRejected changeOutcome = 5
 )
 
@@ -86,7 +78,6 @@ func (c changeOutcome) String() string {
 	return fmt.Sprintf("unknown(%d)", int(c))
 }
 
-// secrets returns every secret this payload carries, for scrubbing helper output before it is logged.
 func (p SwiftPayload) secrets() []string {
 	s := make([]string, 0, 3)
 	for _, v := range []string{p.TargetPass, p.OldPass, p.AdminPass} {
@@ -97,7 +88,7 @@ func (p SwiftPayload) secrets() []string {
 	return s
 }
 
-// redactSecrets masks every known secret in text. The helper itself never interpolates a password into its [SWIFT] lines, but sysadminctl inherits the helper's stderr and OpenDirectory errors can echo the password back, so this scrubbing is a belt-and-suspenders precaution.
+// redactSecrets masks payload secrets in helper output before logging.
 func redactSecrets(text string, secrets []string) string {
 	for _, s := range secrets {
 		text = strings.ReplaceAll(text, s, "[REDACTED]")
@@ -105,7 +96,6 @@ func redactSecrets(text string, secrets []string) string {
 	return text
 }
 
-// runner abstracts process execution so the account-repair ladder (heal/bridge/dscl) is testable; CombinedOutput semantics — a non-zero exit comes back as an error carrying ExitCode().
 type runner interface {
 	Run(ctx context.Context, stdin, name string, args ...string) ([]byte, error)
 }
@@ -113,14 +103,14 @@ type runner interface {
 type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, stdin, name string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := commandContext(ctx, name, args...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
 	return cmd.CombinedOutput()
 }
 
-// exitCode extracts a process exit status from a runner error. ok=false means the process never ran or was killed by the context — callers must not read that as a verdict.
+// exitCode returns ok=false if the process did not run or timed out.
 func exitCode(err error) (int, bool) {
 	var ec interface{ ExitCode() int }
 	if errors.As(err, &ec) {
@@ -129,19 +119,46 @@ func exitCode(err error) (int, bool) {
 	return -1, false
 }
 
-type MacOSManager struct {
-	run    runner
-	sleep  func(time.Duration)                                        // injectable so the phantom-recovery tests don't spend real seconds in opendirectoryd settle waits
-	prompt func(ctx context.Context, targetUser, newPass string) bool // the GUI/AbR token prompt; injectable because the real one drives osascript at the console
+type promptResult struct {
+	outcome           passwordOutcome
+	user              string
+	wrongPasswordRuns int
+	windowFailedRuns int
+	windowFailed     bool
 }
 
+type MacOSManager struct {
+	run    runner
+	sleep  func(time.Duration)                                                // injectable, so the phantom-recovery tests do not spend real seconds in opendirectoryd settle waits
+	prompt func(ctx context.Context, targetUser, newPass string) promptResult // the token prompt. Injectable, because the real one shows a window at the console
+	probe  func(ctx context.Context, url string) error                        // the vault reachability probe. Injectable, so preflight tests need no network
+	now    func() time.Time                                                   // injectable clock for the heal cooldown
+	healStatePath string
+	escrowBridge BridgeEscrow
+	openWindow func(ctx context.Context, uid, user string, req dialogRequest) (passwordWindow, error)
+	promptStatePath string
+	openApp func(ctx context.Context, uid, user, appName string) error
+	authSocketPath string
+	lstat func(string) (os.FileInfo, error)
+	wrongPasswordPause time.Duration
+	pauseTick time.Duration
+}
+
+func (m *MacOSManager) SetBridgeEscrow(escrow BridgeEscrow) { m.escrowBridge = escrow }
+
 func NewManager() Manager {
-	m := &MacOSManager{run: execRunner{}, sleep: time.Sleep}
+	m := &MacOSManager{run: execRunner{}, sleep: time.Sleep, probe: probeVaultEndpoint, now: time.Now, healStatePath: healStatePath, lstat: os.Lstat}
 	m.prompt = m.promptUserForToken
+	m.authSocketPath = authSocketPath
+	m.openApp = openAppAsUser
+	m.openWindow = m.openAuthWindow
+	m.promptStatePath = promptStatePath
+	m.wrongPasswordPause = wrongPasswordPause
+	m.pauseTick = pauseTick
 	return m
 }
 
-// withReserve derives a sub-context of at most want, while always leaving reserve of the run budget for the steps that follow. A non-positive remainder yields an already-expired context, so callers bail out instead of starting work they cannot finish.
+// withReserve derives a sub-context capped at want while keeping reserve time for later steps.
 func withReserve(ctx context.Context, want, reserve time.Duration) (context.Context, context.CancelFunc) {
 	if deadline, ok := ctx.Deadline(); ok {
 		if available := time.Until(deadline) - reserve; available < want {
@@ -151,7 +168,7 @@ func withReserve(ctx context.Context, want, reserve time.Duration) (context.Cont
 	return context.WithTimeout(ctx, want)
 }
 
-// runSwiftHelper executes the helper and returns its exit code. A non-zero code is a VERDICT, not a transport error — only a helper that could not run at all (or was killed by the run deadline) yields an error, because those two cases must not be read as "the password is wrong".
+// runSwiftHelper returns the helper exit code as a verdict; non-nil error means the helper failed to run.
 func (m *MacOSManager) runSwiftHelper(ctx context.Context, payload SwiftPayload) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
@@ -161,8 +178,12 @@ func (m *MacOSManager) runSwiftHelper(ctx context.Context, payload SwiftPayload)
 		return -1, fmt.Errorf("failed to marshal JSON payload: %w", err)
 	}
 
-	out, err := m.run.Run(ctx, string(data), "/usr/local/bin/mac_helper")
-	// The [SWIFT] lines are the only record of whether the rotation fell back to an administrative reset (i.e. whether the account may have lost its Secure Token), and since v1.2 they also carry sysadminctl's own refusal text — so they must be logged on success too, not only in the error.
+	if err := m.trustedBinary(helperPath); err != nil {
+		log.Printf("[ERROR] The helper failed its integrity check, no password was sent to it: %v\n", err)
+		return -1, fmt.Errorf("refusing to run the helper: %w", err)
+	}
+	out, err := m.run.Run(ctx, string(data), helperPath)
+	// Log [SWIFT] lines on success too so admin-reset fallbacks and sysadminctl refusals stay visible.
 	output := redactSecrets(strings.TrimSpace(string(out)), payload.secrets())
 	for _, line := range strings.Split(output, "\n") {
 		if line = strings.TrimSpace(line); line != "" {
@@ -189,7 +210,23 @@ func (m *MacOSManager) callSwiftHelper(ctx context.Context, payload SwiftPayload
 	return nil
 }
 
-func (m *MacOSManager) GetSystemInfo(ctx context.Context) (string, string) {
+var macSerialPattern = regexp.MustCompile(`^[A-Z0-9]{8,20}$`)
+
+// parseMacSerial validates the hardware serial so missing values never collide on one vault record.
+func parseMacSerial(ioregOutput string) (string, error) {
+	re := regexp.MustCompile(`"IOPlatformSerialNumber" = "([^"]+)"`)
+	matches := re.FindStringSubmatch(ioregOutput)
+	if len(matches) < 2 {
+		return "", errors.New("ioreg reported no IOPlatformSerialNumber")
+	}
+	serial := strings.TrimSpace(matches[1])
+	if serial == "" || strings.EqualFold(serial, "Unknown") || !macSerialPattern.MatchString(serial) {
+		return "", fmt.Errorf("ioreg reported an unusable serial %q", serial)
+	}
+	return serial, nil
+}
+
+func (m *MacOSManager) GetSystemInfo(ctx context.Context) (string, string, error) {
 	log.Printf("[INFO] --- GoLAPS macOS Agent (Version: %s) --- \n", version.Version)
 
 	hostname, err := os.Hostname()
@@ -200,23 +237,21 @@ func (m *MacOSManager) GetSystemInfo(ctx context.Context) (string, string) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "ioreg", "-c", "IOPlatformExpertDevice", "-d", "2")
+	cmd := commandContext(ctx, toolIoreg, "-c", "IOPlatformExpertDevice", "-d", "2")
 	output, err := cmd.Output()
-	serial := "Unknown"
-
-	if err == nil {
-		re := regexp.MustCompile(`"IOPlatformSerialNumber" = "([^"]+)"`)
-		matches := re.FindStringSubmatch(string(output))
-		if len(matches) > 1 {
-			serial = strings.TrimSpace(matches[1])
-		}
+	if err != nil {
+		return hostname, "", fmt.Errorf("could not read the serial through ioreg: %w", err)
 	}
-	return hostname, serial
+	serial, err := parseMacSerial(string(output))
+	if err != nil {
+		return hostname, "", err
+	}
+	return hostname, serial, nil
 }
 
-// userAccountExists reports whether a local account exists. The error is deliberately separate from the bool: a failed *check* must never be read as "the account is missing", because that reading feeds the destructive auto-heal path below.
+// userAccountExists separates check errors from a missing account to avoid accidental recreation.
 func (m *MacOSManager) userAccountExists(ctx context.Context, user string) (bool, error) {
-	out, err := m.run.Run(ctx, "", "id", "-u", user)
+	out, err := m.run.Run(ctx, "", toolID, "-u", user)
 	if err == nil {
 		return true, nil
 	}
@@ -224,7 +259,6 @@ func (m *MacOSManager) userAccountExists(ctx context.Context, user string) (bool
 		return false, fmt.Errorf("could not check whether %s exists: %w", user, ctx.Err())
 	}
 	if code, ok := exitCode(err); ok {
-		// A non-zero exit is how `id` reports a missing account ("id: <user>: no such user").
 		if !strings.Contains(string(out), "no such user") {
 			log.Printf("[INFO] id -u %s exited %d: %s\n", user, code, strings.TrimSpace(string(out)))
 		}
@@ -233,101 +267,226 @@ func (m *MacOSManager) userAccountExists(ctx context.Context, user string) (bool
 	return false, fmt.Errorf("could not run id -u %s: %w", user, err)
 }
 
-// EnsureUserAndChangePassword manages account existence and triggers native password rotation. IMPLEMENTS AGGRESSIVE AUTO-HEALING: If the user exists but lacks a token, it deletes the user to reset the SEP crypto-chain.
-func (m *MacOSManager) EnsureUserAndChangePassword(ctx context.Context, user, oldPassword, altOldPass, newPassword string) error {
-	// 5 minutes, not 2: the worst path stacks two 60s-capped helper calls on top of the heal ladder (delete, bridge, recreate, cache resets, sleeps), and a deadline expiring between the delete and the recreate leaves the device without its admin until the next check-in; the run budget still caps everything above.
+// EnsureUserAndChangePassword rotates the target admin using candidates in order, or recreates it if unusable.
+func (m *MacOSManager) EnsureUserAndChangePassword(ctx context.Context, user string, candidates []string, newPassword string) error {
+	if len(candidates) == 0 {
+		candidates = []string{""}
+	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	// 1. Check if user exists
 	userExists, err := m.userAccountExists(ctx, user)
 	if err != nil {
 		return err
 	}
 
-	// 2. Account missing entirely — create it and let ManageSecureToken grant the token afterwards.
 	if !userExists {
 		log.Printf("[WARNING] macOS user %s not found. Initiating Auto-Healing...\n", user)
 		return m.createHiddenAdmin(ctx, user, "IT Admin", newPassword)
 	}
 
-	// Deleting an admin account is irreversible, so it must be driven by a definite answer from macOS. An errored check (timeout, hung opendirectoryd) used to be indistinguishable from "no token" and silently triggered the deletion — abort instead and let the MDM retry.
+	// Require a definite token-state answer before taking any destructive heal path.
 	hasToken, tokenErr := m.secureTokenState(ctx, user)
 	if tokenErr != nil {
 		return fmt.Errorf("refusing to auto-heal %s: could not determine its Secure Token state: %w", user, tokenErr)
 	}
 
-	// 3. No token: the SEP chain is already broken, so recreation costs nothing and fixes the crypto state.
+	// Accounts without a Secure Token rotate in place via administrative reset instead of daily recreation.
 	if !hasToken {
-		return m.healAccount(ctx, user, newPassword)
+		return m.rotateTokenless(ctx, user, candidates, newPassword)
 	}
 
-	// 4. Token holder, but OpenDirectory refuses to let it authenticate ("until password is changed"). Production forensics exhausted every soft repair — counter clear, legacy/per-user policy clears, MDM UnlockUserAccount, opendirectoryd restart, multiple reboots — the state is persistent on-disk/KDC, so recreation is the only cure. laps_token.sh runs those soft repairs before this binary, so reaching here blocked means they already failed.
-	// Anchored on "allowed to authenticate": covers both Apple phrasings (incl. "is not be allowed to authenticate until password is changed") while no known pwpolicy ERROR output contains it — a bare "not"+"allowed" match could heal a healthy admin over an error message. Exit code is informational (undocumented for blocked accounts); only a no-output failure skips the gate, and the rotation below still verifies the real state.
-	out, pwErr := m.run.Run(ctx, "", "pwpolicy", "-u", user, "authentication-allowed")
+	// Recreate if OpenDirectory still blocks authentication after preflight soft repairs.
+	out, pwErr := m.run.Run(ctx, "", toolPwpolicy, "-u", user, "authentication-allowed")
 	verdict := strings.TrimSpace(string(out))
 	if pwErr != nil && verdict == "" {
-		log.Printf("[WARNING] pwpolicy gave no authentication-allowed verdict for %s (%v) — skipping the gate this run.\n", user, pwErr)
+		log.Printf("[WARNING] pwpolicy gave no authentication-allowed verdict for %s (%v) — skipping the gate this run; the rotation below still verifies the real state.\n", user, pwErr)
 	} else if strings.Contains(verdict, "not") && strings.Contains(verdict, "allowed to authenticate") {
 		log.Printf("[WARNING] %s holds a Secure Token but cannot authenticate (%s). Escalating to account recreation — the token grant afterwards may prompt the console user via Admin By Request.\n", user, verdict)
 		return m.healAccount(ctx, user, newPassword)
 	}
 
-	// 5. Rotate. AllowAdminReset stays false for a token holder: sysadminctl's reset would either exit 0 while opendirectoryd refused (escrowing a password the device never took — observed in production) or succeed while leaving the SEP-wrapped volume key behind, which shows as ENABLED but no longer unlocks FileVault at preboot.
+	// Keep AllowAdminReset false for Secure Token holders to avoid phantom resets or broken FileVault keys.
 	log.Printf("[INFO] User %s found with intact Secure Token. Delegating password reset to Swift Helper...", user)
 
-	outcome, err := m.runSwiftHelper(ctx, SwiftPayload{
-		Action:          "change_password",
-		TargetUser:      user,
-		TargetPass:      newPassword,
-		OldPass:         oldPassword,
-		AllowAdminReset: false,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to change password natively: %w", err)
-	}
-
-	// The two vault copies (staged pending and recorded) can each be the live one depending on where the previous run died — a fleet-wide rollout produced both shapes via vault write contention. Trying the second candidate costs one helper call; recreation costs the Secure Token and a user prompt.
-	if changeOutcome(outcome) == changeAuthFailed && altOldPass != "" && altOldPass != oldPassword {
-		log.Printf("[INFO] The primary password candidate for %s no longer authenticates; trying the alternate one before escalating to recreation.\n", user)
+	// On a lock verdict, clear failedLoginCount once and retry to distinguish transient lockouts from persistent OD 5305.
+	var outcome int
+	clearUsed := false
+	for i, candidate := range candidates {
+		if i == 1 {
+			log.Printf("[INFO] The primary password candidate for %s no longer authenticates; trying the alternate one before escalating to recreation.\n", user)
+		} else if i > 1 {
+			log.Printf("[INFO] Password candidate %d of %d for %s did not authenticate either; trying the next one before escalating to recreation.\n", i, len(candidates), user)
+		}
+		var err error
 		outcome, err = m.runSwiftHelper(ctx, SwiftPayload{
 			Action:          "change_password",
 			TargetUser:      user,
 			TargetPass:      newPassword,
-			OldPass:         altOldPass,
+			OldPass:         candidate,
 			AllowAdminReset: false,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to change password natively: %w", err)
 		}
-		if changeOutcome(outcome) == changeOK {
-			log.Printf("[SUCCESS] The alternate password candidate was the live one — rotation completed without recreation.\n")
+		if changeOutcome(outcome) == changeLocked && !clearUsed {
+			clearUsed = true
+			log.Printf("[WARNING] %s reports locked (OD 5305) although its failed-login counter was cleared at preflight — clearing it again and retrying the authenticated change once before anything destructive.\n", user)
+			m.clearFailedLoginCounter(ctx, user)
+			outcome, err = m.runSwiftHelper(ctx, SwiftPayload{
+				Action:          "change_password",
+				TargetUser:      user,
+				TargetPass:      newPassword,
+				OldPass:         candidate,
+				AllowAdminReset: false,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to change password natively: %w", err)
+			}
 		}
+		if changeOutcome(outcome) == changeAuthFailed && i < len(candidates)-1 {
+			continue
+		}
+		if changeOutcome(outcome) == changeOK && i > 0 {
+			log.Printf("[SUCCESS] The alternate password candidate was the live one — rotation completed without recreation.\n")
+			log.Printf("[INFO] Password candidate %d of %d for %s was the live one.\n", i+1, len(candidates), user)
+		}
+		break
 	}
 
 	switch changeOutcome(outcome) {
 	case changeOK:
 		return nil
 	case changeAuthFailed, changeLocked:
-		// The recorded password no longer opens the account. Recreation is the honest cure: an administrative reset here is exactly the phantom/FileVault risk described above, and it is what hid this state behind a green PASS for weeks.
 		log.Printf("[WARNING] %s holds a Secure Token but the recorded password no longer authenticates (%s). Escalating to account recreation rather than an administrative reset.\n", user, changeOutcome(outcome))
 		return m.healAccount(ctx, user, newPassword)
 	case changePolicyRejected:
-		// The account is healthy — the generated password lost to the device's password policy. Recreation would destroy a working admin over a dice roll; the next run generates a fresh password.
 		return fmt.Errorf("the device's password policy rejected the generated password for %s (OD 5402-5407): %w — not recreating a healthy account; the next run retries with a new password", user, ErrPolicyRejected)
 	default:
 		return fmt.Errorf("rotating the password for %s failed (%s)", user, changeOutcome(outcome))
 	}
 }
 
-// healAccount deletes and recreates the target admin, bridging macOS's last-admin guard with a temporary bridge admin when the target is the only admin left. It always ends with the account recreated under newPassword; the Secure Token grant happens later, in ManageSecureToken (which may prompt the console user via Admin By Request).
+// rotateTokenless tries authenticated changes first and enables AllowAdminReset only on the final candidate.
+func (m *MacOSManager) rotateTokenless(ctx context.Context, user string, candidates []string, newPassword string) error {
+	log.Printf("[INFO] %s holds no Secure Token. Rotating it in place (authenticated change, administrative reset as fallback) instead of recreating it — the token grant that follows is what restores the SEP chain, and keeping the account spares the device a daily recreation.\n", user)
+	if len(candidates) == 0 {
+		candidates = []string{""}
+	}
+
+	var outcome int
+	for i := 0; i < len(candidates); i++ {
+		last := i == len(candidates)-1
+		if i > 0 {
+			log.Printf("[INFO] Password candidate %d of %d for %s did not authenticate; trying the next one before the administrative reset.\n", i, len(candidates), user)
+		}
+		var err error
+		outcome, err = m.runSwiftHelper(ctx, SwiftPayload{
+			Action:          "change_password",
+			TargetUser:      user,
+			TargetPass:      newPassword,
+			OldPass:         candidates[i],
+			AllowAdminReset: last,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to change password natively: %w", err)
+		}
+		if last {
+			break
+		}
+		if changeOutcome(outcome) == changeAuthFailed {
+			continue
+		}
+		if changeOutcome(outcome) == changeLocked {
+			log.Printf("[WARNING] %s reports locked (OD 5305) during the in-place rotation; skipping the remaining password candidates and going to the administrative reset.\n", user)
+			i = len(candidates) - 2
+			continue
+		}
+		break
+	}
+
+	switch changeOutcome(outcome) {
+	case changeOK:
+		log.Printf("[SUCCESS] %s rotated in place without recreation.\n", user)
+		return nil
+	case changePolicyRejected:
+		return fmt.Errorf("the device's password policy rejected the generated password for %s (OD 5402-5407): %w — not recreating a healthy account; the next run retries with a new password", user, ErrPolicyRejected)
+	case changeResetRefused, changeODError, changeAuthFailed, changeLocked:
+		log.Printf("[WARNING] %s could not be rotated in place (%s). Escalating to account recreation.\n", user, changeOutcome(outcome))
+		return m.healAccount(ctx, user, newPassword)
+	default:
+		return fmt.Errorf("rotating the password for %s failed (%s)", user, changeOutcome(outcome))
+	}
+}
+
+// healAccount deletes and recreates targetUser, using laps-bridge if macOS refuses to delete the last admin.
 func (m *MacOSManager) healAccount(ctx context.Context, user, newPassword string) error {
+	if err := m.healCooldownError(user); err != nil {
+		return err
+	}
+	if err := m.soleAccountError(ctx, user); err != nil {
+		return err
+	}
+	if err := m.recreateAccount(ctx, user, newPassword); err != nil {
+		return err
+	}
+	m.recordHeal(user)
+	return nil
+}
+
+// soleAccountError aborts recreation if user is both the only admin and the only Secure Token holder.
+func (m *MacOSManager) soleAccountError(ctx context.Context, user string) error {
+	hasToken, err := m.secureTokenState(ctx, user)
+	if err != nil || !hasToken {
+		return nil
+	}
+	if m.otherTokenHolderExists(ctx, user) {
+		return nil
+	}
+	if m.otherAdminExists(ctx, user) {
+		return nil
+	}
+	msg := fmt.Sprintf("[SOLE ACCOUNT] %s is the only admin and the only Secure Token holder; macOS refuses to delete it. Recreation is impossible. Check the vault record: a reassigned or re-enrolled Mac still carries the previous owner's password; the legacy enrollment password is tried last.", user)
+	log.Println(msg)
+	return errors.New(msg)
+}
+
+func (m *MacOSManager) otherTokenHolderExists(ctx context.Context, user string) bool {
+	if out, err := m.run.Run(ctx, "", toolDiskutil, "apfs", "listCryptoUsers", "/"); err == nil {
+		if holders := countLocalCryptoUsers(string(out)); holders >= 0 {
+			return holders > 1
+		}
+	}
+	log.Printf("[WARNING] diskutil did not list the crypto users of the system volume. Falling back to the per-account Secure Token scan.\n")
+	for _, holder := range m.getTokenHolders(ctx) {
+		if holder != user {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *MacOSManager) otherAdminExists(ctx context.Context, user string) bool {
+	out, err := m.run.Run(ctx, "", toolDscl, ".", "-list", "/Users", "UniqueID")
+	if err != nil {
+		log.Printf("[WARNING] Could not enumerate local users for the sole-account check: %v\n", err)
+		return true
+	}
+	for _, name := range parseLocalUsers(string(out)) {
+		if name != user && m.inAdminGroup(ctx, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *MacOSManager) recreateAccount(ctx context.Context, user, newPassword string) error {
 	log.Printf("[WARNING] User %s exists but is unusable (no token, or locked beyond repair). Deleting account to heal crypto-chain...\n", user)
 
-	if out, err := m.run.Run(ctx, "", "sysadminctl", "-deleteUser", user); err != nil {
+	if out, err := m.run.Run(ctx, "", toolSysadminctl, "-deleteUser", user); err != nil {
 		log.Printf("[WARNING] sysadminctl -deleteUser %s failed: %v | output: %s\n", user, err, strings.TrimSpace(string(out)))
 	}
-	// NEVER fall back to a raw `dscl . -delete` here: it bypasses macOS's last-admin guard, deletes only the directory record and orphans the SEP identity / LKDC principal — after which sysadminctl -addUser for the same name exits 0 without creating anything, forever (a create-phantom state observed in production).
+	// Never fall back to dscl -delete; it bypasses the last-admin guard and orphans the SEP identity.
 	stillThere, err := m.userAccountExists(ctx, user)
 	if err != nil {
 		return err
@@ -336,13 +495,12 @@ func (m *MacOSManager) healAccount(ctx context.Context, user, newPassword string
 		return m.createHiddenAdmin(ctx, user, "IT Admin", newPassword)
 	}
 
-	// sysadminctl refused — on AbR-managed Macs the humans are demoted, so the target IS the last admin. Bridge the constraint: a second admin (no Secure Token needed, the guard counts admins) makes the target deletable the supported way.
+	// Target is the last admin; create a temporary bridge admin so sysadminctl allows deletion.
 	log.Printf("[WARNING] %s survived deletion — it is likely the last admin (Admin By Request demotes the humans). Creating a temporary bridge admin...\n", user)
 	return m.withBridgeAdmin(ctx, user, func() error {
-		if out, err := m.run.Run(ctx, "", "sysadminctl", "-deleteUser", user); err != nil {
+		if out, err := m.run.Run(ctx, "", toolSysadminctl, "-deleteUser", user); err != nil {
 			log.Printf("[WARNING] sysadminctl -deleteUser %s (with bridge) failed: %v | output: %s\n", user, err, strings.TrimSpace(string(out)))
 		}
-		// userAccountExists answers "does it exist" — reading it as "is it gone" inverted this check and made every successful last-admin deletion abort before the recreate, leaving the bridge as the device's only admin (caught by TestHealAccountBridgesLastAdminGuard; the bridge path had never fired live).
 		stillExists, err := m.userAccountExists(ctx, user)
 		if err != nil {
 			return err
@@ -351,23 +509,22 @@ func (m *MacOSManager) healAccount(ctx context.Context, user, newPassword string
 			return fmt.Errorf("could not delete %s even with a bridge admin present: the account still exists", user)
 		}
 		log.Printf("[INFO] %s deleted with the bridge admin holding the admin count. Recreating it inside the bridge window...\n", user)
-		// Recreate INSIDE the bridge window, so a failure here can never leave the device with no admin at all.
+		// Recreate inside the bridge window so a failure never leaves the Mac without an admin.
 		return m.createHiddenAdmin(ctx, user, "IT Admin", newPassword)
 	})
 }
 
-// createHiddenAdmin creates a hidden local admin and verifies it really exists afterwards.
 func (m *MacOSManager) createHiddenAdmin(ctx context.Context, name, fullName, pass string) error {
 	addUser := func() error {
-		out, err := m.run.Run(ctx, pass+"\n", "sysadminctl", "-addUser", name, "-fullName", fullName, "-password", "-", "-admin")
-		// Log the output even on exit 0: sysadminctl reports its real failures there while still exiting clean, and this line is the only fleet-wide window into WHY a create-phantom happens. The password travels via stdin, so the output carries no secret.
-		if o := redactSecrets(strings.TrimSpace(string(out)), []string{pass}); o != "" {
-			log.Printf("[INFO] sysadminctl -addUser %s output: %s\n", name, o)
+		out, err := m.run.Run(ctx, pass+"\n", toolSysadminctl, "-addUser", name, "-fullName", fullName, "-password", "-", "-admin")
+		output := redactSecrets(strings.TrimSpace(string(out)), []string{pass})
+		if output != "" {
+			log.Printf("[INFO] sysadminctl -addUser %s output: %s\n", name, output)
 		}
 		if err != nil {
-			return fmt.Errorf("failed to create %s: %w | output: %s", name, err, strings.TrimSpace(string(out)))
+			return fmt.Errorf("failed to create %s: %w | output: %s", name, err, output)
 		}
-		if out, err := m.run.Run(ctx, "", "dscl", ".", "create", "/Users/"+name, "IsHidden", "1"); err != nil {
+		if out, err := m.run.Run(ctx, "", toolDscl, ".", "create", "/Users/"+name, "IsHidden", "1"); err != nil {
 			log.Printf("[WARNING] Could not hide %s from the login window: %v | output: %s\n", name, err, strings.TrimSpace(string(out)))
 		}
 		m.sleep(2 * time.Second)
@@ -386,7 +543,7 @@ func (m *MacOSManager) createHiddenAdmin(ctx context.Context, name, fullName, pa
 	}
 
 	log.Printf("[WARNING] sysadminctl reported no error but %s does not exist after creation. Resetting the OD cache and retrying once...\n", name)
-	if out, err := m.run.Run(ctx, "", "odutil", "reset", "cache"); err != nil {
+	if out, err := m.run.Run(ctx, "", toolOdutil, "reset", "cache"); err != nil {
 		log.Printf("[WARNING] odutil reset cache failed: %v | output: %s\n", err, strings.TrimSpace(string(out)))
 	}
 	m.sleep(3 * time.Second)
@@ -402,7 +559,7 @@ func (m *MacOSManager) createHiddenAdmin(ctx context.Context, name, fullName, pa
 		}
 	}
 	if !created {
-		// Last resort: root assembles the record directly through dscl, bypassing sysadminctl entirely. Unlike sysadminctl this path fails LOUDLY (eDSRecordAlreadyExists names a tombstone record, etc.), so even its failure finally says WHY the account cannot exist.
+		// Last resort: assemble the account via dscl and set its password over stdin.
 		log.Printf("[WARNING] sysadminctl create-phantom persists for %s. Building the account directly via dscl as root...\n", name)
 		if err := m.createAdminViaDscl(ctx, name, fullName, pass); err != nil {
 			return fmt.Errorf("sysadminctl silently failed twice and the direct dscl build failed too: %w", err)
@@ -418,10 +575,9 @@ func (m *MacOSManager) createHiddenAdmin(ctx context.Context, name, fullName, pa
 	return nil
 }
 
-// createAdminViaDscl assembles a hidden local admin record attribute by attribute, as root. `dscl . -passwd` cannot read from stdin, so the record is first sealed with a THROWAWAY password (that one does appear in argv) and immediately rotated to the real password through the Swift helper over stdin — the real password never touches a process argument list, and the throwaway is dead by the time any observer reads it.
+// createAdminViaDscl builds a local admin without passing any password in argv, then sets the password via mac_helper.
 func (m *MacOSManager) createAdminViaDscl(ctx context.Context, name, fullName, pass string) error {
-	// Pick the first free UID at or above 501.
-	out, err := m.run.Run(ctx, "", "dscl", ".", "-list", "/Users", "UniqueID")
+	out, err := m.run.Run(ctx, "", toolDscl, ".", "-list", "/Users", "UniqueID")
 	if err != nil {
 		return fmt.Errorf("could not list existing UIDs: %w | %s", err, strings.TrimSpace(string(out)))
 	}
@@ -439,11 +595,6 @@ func (m *MacOSManager) createAdminViaDscl(ctx context.Context, name, fullName, p
 		uid++
 	}
 
-	throwaway, err := password.Generate(0)
-	if err != nil {
-		return fmt.Errorf("could not generate a throwaway password: %w", err)
-	}
-
 	steps := [][]string{
 		{"-create", "/Users/" + name},
 		{"-create", "/Users/" + name, "UserShell", "/bin/zsh"},
@@ -452,80 +603,106 @@ func (m *MacOSManager) createAdminViaDscl(ctx context.Context, name, fullName, p
 		{"-create", "/Users/" + name, "PrimaryGroupID", "20"},
 		{"-create", "/Users/" + name, "NFSHomeDirectory", "/Users/" + name},
 		{"-create", "/Users/" + name, "IsHidden", "1"},
-		{"-passwd", "/Users/" + name, throwaway},
 	}
 	for _, args := range steps {
-		if out, err := m.run.Run(ctx, "", "dscl", append([]string{"."}, args...)...); err != nil {
-			return fmt.Errorf("dscl %s failed: %w | %s", args[0]+" "+args[1], err, redactSecrets(strings.TrimSpace(string(out)), []string{throwaway}))
+		if out, err := m.run.Run(ctx, "", toolDscl, append([]string{"."}, args...)...); err != nil {
+			return fmt.Errorf("dscl %s failed: %w | %s", args[0]+" "+args[1], err, strings.TrimSpace(string(out)))
 		}
 	}
-	if out, err := m.run.Run(ctx, "", "dseditgroup", "-o", "edit", "-a", name, "-t", "user", "admin"); err != nil {
-		return fmt.Errorf("could not add %s to the admin group: %w | %s", name, err, strings.TrimSpace(string(out)))
-	}
 
-	// Rotate throwaway -> real over stdin. The account was created seconds ago and provably holds no Secure Token, so the administrative reset is safe here as a fallback — this is the one place AllowAdminReset is legitimately true.
+	// Set the password over stdin via mac_helper before adding the account to the admin group.
 	if err := m.callSwiftHelper(ctx, SwiftPayload{
 		Action:          "change_password",
 		TargetUser:      name,
 		TargetPass:      pass,
-		OldPass:         throwaway,
 		AllowAdminReset: true,
 	}); err != nil {
-		return fmt.Errorf("account %s built via dscl, but rotating the throwaway password failed (the account is left with an unknown password; the next run's auto-heal recycles it): %w", name, err)
+		return fmt.Errorf("account %s built via dscl, but setting its password over stdin failed (the record has no credential and is not an admin; the next run's auto-heal recycles it): %w", name, err)
 	}
-	log.Printf("[INFO] %s built via dscl (UID %d), added to the admin group, real password set over stdin.\n", name, uid)
+	if out, err := m.run.Run(ctx, "", toolDseditgroup, "-o", "edit", "-a", name, "-t", "user", "admin"); err != nil {
+		return fmt.Errorf("could not add %s to the admin group: %w | %s", name, err, strings.TrimSpace(string(out)))
+	}
+	log.Printf("[INFO] %s built via dscl (UID %d): password set over stdin, then added to the admin group.\n", name, uid)
 	m.sleep(2 * time.Second)
 	return nil
 }
 
-// legacyBridgeAdmin is the temporary second admin used to satisfy macOS's last-admin guard. On devices migrated from a previous MDM the same account may already exist, so bridging reuses it instead of creating anything, and any leftover is later removed by laps_token.sh's own legacy-admin cleanup once the target holds a Secure Token.
-const legacyBridgeAdmin = "laps-bridge"
+// bridgeFullName distinguishes a GoLAPS-created bridge from a legacy laps-bridge account.
+const bridgeFullName = "IT Recovery Bridge"
 
-// withBridgeAdmin runs fn while a second admin keeps the admin count above one, so macOS's last-admin guard cannot refuse deleting the target. The bridge needs no Secure Token — the guard counts admins, not token holders.
+// withBridgeAdmin runs fn with laps-bridge present after escrowing its password and verifying another token holder exists.
 func (m *MacOSManager) withBridgeAdmin(ctx context.Context, targetUser string, fn func() error) error {
-	bridge := legacyBridgeAdmin
+	bridge := LegacyBridgeAdmin
 
 	if exists, err := m.userAccountExists(ctx, bridge); err != nil {
 		return err
 	} else if !exists {
-		bridgePass, err := password.Generate(0) // 0 -> generator default length; the bridge is never authenticated as, the password exists only because -addUser requires one
+		if err := m.bridgeSafeToCreate(ctx); err != nil {
+			return err
+		}
+		if m.escrowBridge == nil {
+			return fmt.Errorf("no escrow route for the bridge password; not creating %s", bridge)
+		}
+		bridgePass, err := password.Generate(0) // 0 means the default length of the generator. The password exists because -addUser requires one, and because the bridge may end up as a token holder.
 		if err != nil {
 			return fmt.Errorf("could not generate a password for the bridge admin: %w", err)
 		}
-		if err := m.createHiddenAdmin(ctx, bridge, "IT Recovery Bridge", bridgePass); err != nil {
+		escrowCtx, cancelEscrow := context.WithTimeout(ctx, 60*time.Second)
+		err = m.escrowBridge(escrowCtx, bridgePass)
+		cancelEscrow()
+		if err != nil {
+			return fmt.Errorf("could not escrow the bridge password before creating %s, not creating it: %w", bridge, err)
+		}
+		log.Printf("[INFO] Bridge password escrowed to the vault record before the account is created.\n")
+		if err := m.createHiddenAdmin(ctx, bridge, bridgeFullName, bridgePass); err != nil {
 			return fmt.Errorf("could not create the bridge admin %s: %w", bridge, err)
 		}
 	} else {
 		log.Printf("[INFO] Reusing the existing %s account as the bridge admin.\n", bridge)
+		if !m.inAdminGroup(ctx, bridge) {
+			log.Printf("[WARNING] Existing bridge %s is not in the admin group — re-adding before deleting %s.\n", bridge, targetUser)
+			if out, err := m.run.Run(ctx, "", toolDseditgroup, "-o", "edit", "-a", bridge, "-t", "user", "admin"); err != nil {
+				return fmt.Errorf("could not restore admin group membership for bridge %s: %w | %s", bridge, err, strings.TrimSpace(string(out)))
+			}
+		}
 	}
 
 	fnErr := fn()
 
-	// Cleanup. Refuse to delete the bridge while the target is absent: that would remove the device's only admin.
+	// Never delete the bridge if the target is missing or if the bridge holds a Secure Token.
 	if targetThere, err := m.userAccountExists(ctx, targetUser); err != nil || !targetThere {
 		log.Printf("[ERROR] Keeping bridge admin %s: the target %s is missing and the bridge is the only admin left (check err: %v). The next run will reuse and then remove it.\n", bridge, targetUser, err)
 		return fnErr
 	}
-	// A bridge account that HOLDS a Secure Token may be the device's only token holder, and the freshly recreated target has no token yet — keep it and let laps_token.sh remove it once the target's token is granted (its cleanup already checks exactly that).
 	if hasToken, err := m.secureTokenState(ctx, bridge); err != nil || hasToken {
-		log.Printf("[INFO] Keeping %s for now (Secure Token state: enabled=%v, err=%v). laps_token.sh removes it once %s holds a token.\n", bridge, hasToken, err, targetUser)
+		log.Printf("[INFO] Keeping %s for now (Secure Token state: enabled=%v, err=%v). CleanupLegacyAdmin removes it once %s holds a token.\n", bridge, hasToken, err, targetUser)
 		return fnErr
 	}
-	if out, err := m.run.Run(ctx, "", "sysadminctl", "-deleteUser", bridge); err != nil {
+	if out, err := m.run.Run(ctx, "", toolSysadminctl, "-deleteUser", bridge); err != nil {
 		log.Printf("[WARNING] sysadminctl -deleteUser %s failed: %v | output: %s\n", bridge, err, strings.TrimSpace(string(out)))
 	}
 	if still, err := m.userAccountExists(ctx, bridge); err == nil && still {
-		log.Printf("[WARNING] Bridge admin %s could not be removed this run — laps_token.sh's legacy-admin cleanup will retire it once %s holds a Secure Token.\n", bridge, targetUser)
+		log.Printf("[WARNING] Bridge admin %s could not be removed this run — CleanupLegacyAdmin retires it on a later run once %s holds a Secure Token.\n", bridge, targetUser)
 	}
 	return fnErr
 }
 
 func (m *MacOSManager) ManageSecureToken(ctx context.Context, targetUser, newPass string, availableCreds map[string]string) string {
-	// An errored check is NOT "no token" — but here the safe reading is the opposite one from the auto-heal path: carry on into the grant attempts, which verify the real state afterwards, rather than declaring a token that may well be present.
+	status := m.manageSecureToken(ctx, targetUser, newPass, availableCreds)
+	verdict := "ok"
+	if status == TokenStatusDisabledDeadlock {
+		verdict = "deadlock"
+	}
+	log.Println(m.bridgeReport(ctx, availableCreds, verdict))
+	return status
+}
+
+func (m *MacOSManager) manageSecureToken(ctx context.Context, targetUser, newPass string, availableCreds map[string]string) string {
 	if hasToken, err := m.secureTokenState(ctx, targetUser); err != nil {
 		log.Printf("[WARNING] Could not read the Secure Token state of %s (%v). Continuing as if it had none; the grant path verifies the result.\n", targetUser, err)
 	} else if hasToken {
 		log.Printf("[SUCCESS] Verified: %s already has an active Secure Token.\n", targetUser)
+		m.clearPromptState()
 		return "ENABLED (Auto-Migrated or Existing)"
 	}
 
@@ -536,41 +713,47 @@ func (m *MacOSManager) ManageSecureToken(ctx context.Context, targetUser, newPas
 	for _, admin := range tokenHolders {
 		log.Printf("[INFO] Evaluating token holder candidate: %s\n", admin)
 
-		if adminPass, ok := availableCreds[admin]; ok {
-			log.Printf("[INFO] -> Attempt 1: Trying the vault-recorded password for %s...\n", admin)
-
-			grantErr := m.grantSecureTokenSilently(ctx, targetUser, newPass, admin, adminPass)
-			if grantErr == nil {
-				log.Printf("[SUCCESS] Secure Token granted silently via %s.\n", admin)
-				return "ENABLED (Silent - Vault)"
-			}
-			log.Printf("[WARNING] The vault-recorded password failed for %s. Details: %v\n", admin, grantErr)
+		adminPass, source, ok := m.candidatePassword(ctx, admin, targetUser, availableCreds)
+		if !ok {
+			continue
 		}
-
-		// MDM_FALLBACK_PASS is the legacy *service* admin's password. Trying it against a human account can never succeed and only buries the log in -14090 "Operation is not permitted without secure token unlock" noise that reads like a rights problem.
-		if !isServiceAccount(admin, targetUser, availableCreds) {
-			log.Printf("[INFO] -> Skipping MDM Legacy Password for %s: not an IT-managed service account.\n", admin)
+		if !m.candidateUsable(ctx, admin) {
 			continue
 		}
 
-		if mdmPass, ok := availableCreds["MDM_FALLBACK_PASS"]; ok {
-			log.Printf("[INFO] -> Attempt 2: Trying MDM Legacy Password for %s...\n", admin)
-
-			grantErr := m.grantSecureTokenSilently(ctx, targetUser, newPass, admin, mdmPass)
-			if grantErr == nil {
-				log.Printf("[SUCCESS] Secure Token granted silently via %s (MDM Fallback).\n", admin)
+		log.Printf("[INFO] -> Trying the %s password for %s (one attempt)...\n", source, admin)
+		grantErr := m.grantSecureTokenSilently(ctx, targetUser, newPass, admin, adminPass)
+		if grantErr == nil {
+			log.Printf("[SUCCESS] Secure Token granted silently via %s (%s).\n", admin, source)
+			if source == "MDM Legacy" {
 				return "ENABLED (Silent - MDM)"
 			}
-			log.Printf("[WARNING] MDM Password failed for %s. Details: %v\n", admin, grantErr)
+			return "ENABLED (Silent - Vault)"
 		}
+		log.Printf("[WARNING] %s password failed for %s. Details: %v\n", source, admin, grantErr)
 	}
 
 	log.Println("[WARNING] All silent grant attempts failed or no matching passwords found. Triggering GUI Prompt...")
-	if m.prompt(ctx, targetUser, newPass) {
+	prompt := m.prompt(ctx, targetUser, newPass)
+	if prompt.outcome == passwordOK {
 		return "ENABLED (Via GUI Prompt)"
 	}
 
-	// The prompt failed, so the token stays missing this run — the grant retries on every check-in until it lands; a tokenless service admin is never an accepted end state. Coverage decides only how the failure REPORTS: with an escrowed PRK + bootstrap token the device is degraded (IT unlocks preboot via PRK once), not unrecoverable, so it should not sit permanently red in the MDM console.
+	if len(tokenHolders) == 1 && tokenHolders[0] == LegacyBridgeAdmin {
+		log.Printf("[DEADLOCK] %s is the only Secure Token holder on this Mac and no stored password authenticates as it. %s cannot receive a token and %s cannot be retired. Recovery: log in once as %s at the login window (\"Other...\") with its vault password; the escrowed bootstrap token grants it a Secure Token during that login, and the next run removes %s. Erase the Mac only if that fails.\n", LegacyBridgeAdmin, targetUser, LegacyBridgeAdmin, targetUser, LegacyBridgeAdmin)
+		return TokenStatusDisabledDeadlock
+	}
+
+	// Report consecutive wrong-password or killed-window streaks as hard failures even when MDM recovery exists.
+	if prompt.outcome == passwordFailed && prompt.wrongPasswordRuns >= wrongPasswordRedAfter {
+		log.Printf("[WRONG PASSWORD STREAK] %s entered a wrong password in each of %d attempts in %d consecutive runs; IT follow-up is needed.\n", prompt.user, maxPasswordAttempts, prompt.wrongPasswordRuns)
+		return TokenStatusDisabledWrongPassword
+	}
+	if prompt.windowFailed && prompt.windowFailedRuns >= windowFailedRedAfter {
+		log.Printf("[WINDOW ENDED STREAK] %s ended the password window before an answer in %d consecutive runs; IT follow-up is needed.\n", prompt.user, prompt.windowFailedRuns)
+		return TokenStatusDisabledWindowKilled
+	}
+
 	if m.recoveryCoveredByMDM(ctx) {
 		log.Printf("[WARNING] %s still holds no Secure Token after the prompt, but the device has a personal recovery key and an escrowed bootstrap token — reporting a covered degradation instead of a failure; the grant retries on the next run.\n", targetUser)
 		return TokenStatusDisabledCovered
@@ -579,17 +762,16 @@ func (m *MacOSManager) ManageSecureToken(ctx context.Context, targetUser, newPas
 	return "DISABLED (Review Required)"
 }
 
-// recoveryCoveredByMDM reports whether losing the service admin's Secure Token still leaves MDM a FileVault recovery path: a personal recovery key exists locally AND the bootstrap token is escrowed. Both checks fail closed — an error or unrecognised output reads as "not covered", which keeps the honest red status.
+// recoveryCoveredByMDM returns true only when both a local PRK and an escrowed bootstrap token exist (fails closed).
 func (m *MacOSManager) recoveryCoveredByMDM(ctx context.Context) bool {
-	// This runs AFTER the GUI prompt, i.e. inside the budget reserved for the vault write — a wedged fdesetup/profiles must time out here, never eat the vault reserve.
 	ctx, cancel := withReserve(ctx, 20*time.Second, vaultWriteReserve)
 	defer cancel()
-	out, err := m.run.Run(ctx, "", "fdesetup", "haspersonalrecoverykey")
+	out, err := m.run.Run(ctx, "", toolFdesetup, "haspersonalrecoverykey")
 	if err != nil || !strings.EqualFold(strings.TrimSpace(string(out)), "true") {
 		log.Printf("[INFO] No usable personal recovery key (fdesetup: %q, err: %v) — MDM cannot recover FileVault without the service admin.\n", strings.TrimSpace(string(out)), err)
 		return false
 	}
-	out, err = m.run.Run(ctx, "", "profiles", "status", "-type", "bootstraptoken")
+	out, err = m.run.Run(ctx, "", toolProfiles, "status", "-type", "bootstraptoken")
 	if err != nil || !bootstrapTokenEscrowed(string(out)) {
 		log.Printf("[INFO] Bootstrap token is not escrowed (profiles: %q, err: %v).\n", strings.TrimSpace(string(out)), err)
 		return false
@@ -597,23 +779,53 @@ func (m *MacOSManager) recoveryCoveredByMDM(ctx context.Context) bool {
 	return true
 }
 
-// bootstrapTokenEscrowed parses `profiles status -type bootstraptoken`; the affirmative output ends with "Bootstrap Token escrowed to server: YES".
 func bootstrapTokenEscrowed(output string) bool {
 	return strings.Contains(strings.ToLower(output), "escrowed to server: yes")
 }
 
-// isServiceAccount reports whether login is one of the IT-managed admin accounts that the legacy MDM password could plausibly belong to.
+// candidatePassword picks one stored password for admin; GoLAPS bridges never use the legacy MDM password.
+func (m *MacOSManager) candidatePassword(ctx context.Context, admin, targetUser string, availableCreds map[string]string) (pass, source string, ok bool) {
+	if pass, found := availableCreds[admin]; found && pass != "" {
+		return pass, "1Password specific", true
+	}
+	if admin == LegacyBridgeAdmin && m.isBridgeAccount(ctx) {
+		log.Printf("[INFO] -> %s is a LAPS bridge with no escrowed password; no silent grant is possible through it.\n", admin)
+		return "", "", false
+	}
+	if !isServiceAccount(admin, targetUser, availableCreds) {
+		log.Printf("[INFO] -> Skipping MDM Legacy Password for %s: not an IT-managed service account.\n", admin)
+		return "", "", false
+	}
+	if pass, found := availableCreds["MDM_FALLBACK_PASS"]; found && pass != "" {
+		return pass, "MDM Legacy", true
+	}
+	log.Printf("[INFO] -> No stored password for %s; skipping the silent grant through it.\n", admin)
+	return "", "", false
+}
+
+// candidateUsable skips candidates blocked by pwpolicy or at conflictThreshold to avoid locking them out.
+func (m *MacOSManager) candidateUsable(ctx context.Context, admin string) bool {
+	if verdict := m.pwpolicyVerdict(ctx, admin); authenticationBlocked(verdict) {
+		log.Printf("[INFO] -> Skipping the silent grant through %s: %s\n", admin, verdict)
+		return false
+	}
+	if count := m.failedLoginCount(ctx, admin); count >= conflictThreshold {
+		log.Printf("[INFO] -> Skipping the silent grant through %s: %d failed authentications are already recorded (threshold %d).\n", admin, count, conflictThreshold)
+		return false
+	}
+	return true
+}
+
 func isServiceAccount(login, targetUser string, availableCreds map[string]string) bool {
-	if login == targetUser || login == legacyBridgeAdmin {
+	if login == targetUser || login == LegacyBridgeAdmin {
 		return true
 	}
 	_, known := availableCreds[login]
 	return known
 }
 
-// parseSecureTokenStatus turns `sysadminctl -secureTokenStatus` output into a definite answer. It returns ok=false when macOS said neither ENABLED nor DISABLED, so the caller can tell "this account has no token" apart from "the question was never answered".
 func parseSecureTokenStatus(output string) (enabled, ok bool) {
-	// Match the whole phrase — a bare "ENABLED" test is one typo from matching "DISABLED".
+	// Match full phrases so ENABLED never matches DISABLED.
 	switch {
 	case strings.Contains(output, "is ENABLED"), strings.Contains(output, "is ON"):
 		return true, true
@@ -623,12 +835,12 @@ func parseSecureTokenStatus(output string) (enabled, ok bool) {
 	return false, false
 }
 
-// secureTokenState reports whether user holds a Secure Token. A returned error means macOS did not answer (timeout, hung opendirectoryd, unknown account, unrecognised output) — it does NOT mean the account has no token, and callers must not treat it as such. Reporting a failed check as "no token" is what made a transient sysadminctl failure delete a healthy admin account.
+// secureTokenState returns an error when macOS gives no definite ENABLED/DISABLED answer.
 func (m *MacOSManager) secureTokenState(ctx context.Context, user string) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	out, err := m.run.Run(ctx, "", "sysadminctl", "-secureTokenStatus", user)
+	out, err := m.run.Run(ctx, "", toolSysadminctl, "-secureTokenStatus", user)
 	text := strings.TrimSpace(string(out))
 
 	if enabled, ok := parseSecureTokenStatus(text); ok {
@@ -663,34 +875,98 @@ func (m *MacOSManager) grantSecureTokenSilently(ctx context.Context, targetUser,
 	return nil
 }
 
-// verifyUserPassword checks a login password through the Swift helper (OpenDirectory verifyPassword over the existing stdin channel). It replaces `dscl . -authonly <user> <password>`, which put the console user's own login password in argv — visible to root-level observers, EDR exec telemetry and sysdiagnose, and in direct contradiction with this project's "no credentials on command lines" rule.
-func (m *MacOSManager) verifyUserPassword(ctx context.Context, user, pass string) bool {
-	if err := m.callSwiftHelper(ctx, SwiftPayload{
+// verifyPasswordCode checks credentials through mac_helper over stdin instead of dscl -authonly (argv).
+func (m *MacOSManager) verifyPasswordCode(ctx context.Context, user, pass string) (int, error) {
+	return m.runSwiftHelper(ctx, SwiftPayload{
 		Action:     "verify_password",
 		TargetUser: user,
 		TargetPass: pass,
-	}); err != nil {
+	})
+}
+
+func (m *MacOSManager) VerifyPassword(ctx context.Context, user, pass string) (bool, error) {
+	code, err := m.verifyPasswordCode(ctx, user, pass)
+	if err != nil {
+		return false, err
+	}
+	return code == 0, nil
+}
+
+func (m *MacOSManager) verifyUserPassword(ctx context.Context, user, pass string) bool {
+	code, err := m.verifyPasswordCode(ctx, user, pass)
+	if err == nil && code != 0 {
+		err = fmt.Errorf("swift helper exited %d", code)
+	}
+	if err != nil {
 		log.Printf("[INFO] Password verification for %s did not pass: %v\n", user, err)
 		return false
 	}
 	return true
 }
 
-// getTokenHolders returns every local account that actually holds a Secure Token. It deliberately no longer uses `fdesetup list`: that reports FileVault-*enabled* users, which is a different set. On a Mac where FileVault has not finished enabling, real token holders are missing from it, the list comes back empty, and the old code then fell back to a hardcoded legacy admin — the very account laps_token.sh deletes once the target admin is healthy. The silent grant path then had no credential it could possibly use.
+// bridgeSafeToCreate checks that another local user already holds a Secure Token (ignoring PRK and bootstrap token).
+func (m *MacOSManager) bridgeSafeToCreate(ctx context.Context) error {
+	holders := -1
+	if out, err := m.run.Run(ctx, "", toolDiskutil, "apfs", "listCryptoUsers", "/"); err == nil {
+		holders = countLocalCryptoUsers(string(out))
+	}
+	if holders > 0 {
+		return nil
+	}
+	if holders < 0 {
+		log.Printf("[WARNING] diskutil did not list the crypto users of the system volume. Falling back to the per-account Secure Token scan.\n")
+		if len(m.getTokenHolders(ctx)) > 0 {
+			return nil
+		}
+	}
+	log.Printf("[NO TOKEN HOLDER] heal stopped: no local account holds a Secure Token. A new bridge admin would receive the first Secure Token and the volume ownership. The target account stays as it is.\n")
+	log.Printf("BRIDGE: bridge=absent token=no password=unknown verdict=no-token-holder\n")
+	return fmt.Errorf("%w no local account holds a Secure Token; refusing to create the bridge admin %s. Recovery: log in once as the target at the login window (\"Other...\") with its vault password, the escrowed bootstrap token then grants it a Secure Token, and the next run continues", ErrNoTokenHolder, LegacyBridgeAdmin)
+}
+
+func countLocalCryptoUsers(output string) int {
+	if !strings.Contains(output, "Cryptographic user") {
+		return -1
+	}
+	return strings.Count(output, "Local Open Directory User")
+}
+
+func (m *MacOSManager) isBridgeAccount(ctx context.Context) bool {
+	out, err := m.run.Run(ctx, "", toolDscl, ".", "-read", "/Users/"+LegacyBridgeAdmin, "RealName")
+	return err == nil && strings.Contains(string(out), bridgeFullName)
+}
+
+func (m *MacOSManager) bridgeReport(ctx context.Context, availableCreds map[string]string, verdict string) string {
+	kind, token, pw := "absent", "no", "unknown"
+	if exists, err := m.userAccountExists(ctx, LegacyBridgeAdmin); err == nil && exists {
+		kind = "legacy"
+		if m.isBridgeAccount(ctx) {
+			kind = "bridge"
+		}
+		if enabled, err := m.secureTokenState(ctx, LegacyBridgeAdmin); err == nil && enabled {
+			token = "yes"
+		}
+		if _, ok := availableCreds[LegacyBridgeAdmin]; ok {
+			pw = "vault"
+		}
+	}
+	return fmt.Sprintf("BRIDGE: bridge=%s token=%s password=%s verdict=%s", kind, token, pw, verdict)
+}
+
+// getTokenHolders scans local accounts with sysadminctl instead of fdesetup list, which omits non-FileVault token holders.
 func (m *MacOSManager) getTokenHolders(ctx context.Context) []string {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
 	var holders []string
 
-	out, err := m.run.Run(ctx, "", "dscl", ".", "-list", "/Users", "UniqueID")
+	out, err := m.run.Run(ctx, "", toolDscl, ".", "-list", "/Users", "UniqueID")
 	if err != nil {
 		log.Printf("[WARNING] Could not enumerate local users: %v\n", err)
 	} else {
 		for _, name := range parseLocalUsers(string(out)) {
 			enabled, err := m.secureTokenState(ctx, name)
 			if err != nil {
-				// Say so rather than dropping the account silently: a candidate holder lost to a timeout is a credential the silent grant path will never get to try.
 				log.Printf("[WARNING] Skipping %s as a token-holder candidate: %v\n", name, err)
 				continue
 			}
@@ -701,14 +977,13 @@ func (m *MacOSManager) getTokenHolders(ctx context.Context) []string {
 	}
 
 	if len(holders) == 0 {
-		log.Println("[WARNING] No Secure Token holder found among local accounts. Falling back to the legacy bridge admin.")
-		holders = append(holders, legacyBridgeAdmin)
+		log.Println("[WARNING] No Secure Token holder found among local accounts.")
 	}
 
 	return holders
 }
 
-// parseLocalUsers extracts real (non-system) account names from `dscl . -list /Users UniqueID`. Accounts with UID < 500 are skipped so we don't spawn ~100 sysadminctl calls on system users.
+// parseLocalUsers returns non-system accounts (UID >= 500) from dscl output.
 func parseLocalUsers(dsclOutput string) []string {
 	var users []string
 	for _, line := range strings.Split(dsclOutput, "\n") {
@@ -724,139 +999,76 @@ func parseLocalUsers(dsclOutput string) []string {
 	return users
 }
 
-func (m *MacOSManager) promptUserForToken(ctx context.Context, targetUser, targetPass string) bool {
-	// Everything below waits on a human. Cap it so the vault write that follows still fits inside the run budget instead of being hard-killed by the MDM at 60 minutes.
+func (m *MacOSManager) promptUserForToken(ctx context.Context, targetUser, targetPass string) promptResult {
+	// Reserve vaultWriteReserve so a slow GUI prompt cannot push the run past the MDM timeout.
 	ctx, cancel := withReserve(ctx, time.Hour, vaultWriteReserve)
 	defer cancel()
 
 	if ctx.Err() != nil {
-		log.Println("[WARNING] No time left in the run budget for the GUI prompt; skipping it so the vault write completes.")
-		return false
+		log.Println("[WARNING] No time left in the run budget for the GUI prompt; skipping it so the 1Password write completes.")
+		logPromptReport(reportNoTime)
+		return promptResult{outcome: passwordTimeout}
 	}
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", `scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }'`)
+	cmd := commandContext(ctx, toolSh, "-c", toolScutil+` <<< "show State:/Users/ConsoleUser" | `+toolAwk+` '/Name :/ && ! /loginwindow/ { print $3 }'`)
 	out, err := cmd.Output()
 	if err != nil {
-		return false
+		logPromptReport(reportNoUser)
+		return promptResult{outcome: passwordUnavailable}
 	}
 
 	currentUser := strings.TrimSpace(string(out))
 	if currentUser == "" || currentUser == "root" {
 		log.Println("[WARNING] No standard user logged in. GUI prompt aborted.")
-		return false
+		logPromptReport(reportNoUser)
+		return promptResult{outcome: passwordUnavailable}
+	}
+
+	if m.screenLocked(ctx) {
+		log.Printf("[PROMPT SKIPPED: screen-locked] The screen of %s is locked. The prompt returns on the next check-in.\n", currentUser)
+		logPromptReport(reportLocked)
+		return promptResult{outcome: passwordTimeout, user: currentUser}
 	}
 
 	hasToken, err := m.secureTokenState(ctx, currentUser)
 	if err != nil {
 		log.Printf("[WARNING] Could not read the Secure Token state of the console user (%s): %v. Aborting GUI prompt.\n", currentUser, err)
-		return false
+		logPromptReport(reportUserNoToken)
+		return promptResult{outcome: passwordUnavailable, user: currentUser}
 	}
 	if !hasToken {
 		log.Printf("[WARNING] Current user (%s) lacks a Secure Token. Cannot grant. Aborting GUI prompt.\n", currentUser)
-		return false
+		logPromptReport(reportUserNoToken)
+		return promptResult{outcome: passwordUnavailable, user: currentUser}
 	}
 
-	uidOut, err := exec.CommandContext(ctx, "id", "-u", currentUser).Output()
+	uidOut, err := commandContext(ctx, toolID, "-u", currentUser).Output()
 	uid := strings.TrimSpace(string(uidOut))
 	if err != nil || uid == "" {
-		// Without a uid every `launchctl asuser` below fails instantly, burning the attempt loop in a fast spin and showing the user nothing.
 		log.Printf("[WARNING] Could not resolve the uid of %s: %v. Aborting GUI prompt.\n", currentUser, err)
-		return false
+		logPromptReport(reportNoUser)
+		return promptResult{outcome: passwordUnavailable, user: currentUser}
 	}
 
-	// opendirectoryd only accepts the grant when the authenticating credential is an administrator (refusal 5101 "Credential is not an admin" otherwise), and Admin By Request removes standing admin rights — so on an AbR-managed Mac a standard user's correct password still cannot succeed. Detect that BEFORE asking for the password and walk the user through obtaining a temporary admin session first.
-	if !m.isAdminMember(ctx, currentUser) && !m.ensureAdminViaAbR(ctx, uid, currentUser) {
-		return false
+	// opendirectoryd requires an admin credential for Secure Token grants; start on the AbR step for standard users.
+	needAdmin := !m.isAdminMember(ctx, currentUser)
+	if needAdmin {
+		if _, err := os.Stat(abrAppPath); err != nil {
+			log.Printf("[WARNING] %s is not an administrator and Admin By Request is not installed — the token grant cannot succeed on this Mac.\n", currentUser)
+			logPromptReport(reportNoAbR)
+			return promptResult{outcome: passwordUnavailable, user: currentUser}
+		}
 	}
 
-	// Two separate bounds: wrong passwords consume an attempt, everything else (following the help link, dismissing the dialog) does not — but the dialog count still caps the loop so a dialog that keeps erroring cannot spin forever.
-	const maxAttempts = 5
-	const maxDialogs = 15
-
-	attempt := 1
-	for dialogs := 0; attempt <= maxAttempts && dialogs < maxDialogs; dialogs++ {
-		script := m.generateAppleScript(attempt, maxAttempts)
-
-		asCmd := exec.CommandContext(ctx, "launchctl", "asuser", uid, "osascript")
-		asCmd.Stdin = strings.NewReader(script)
-		asOut, err := asCmd.Output()
-
-		if err != nil {
-			log.Printf("[WARNING] osascript execution failed or timed out: %v", err)
-			return false
-		}
-
-		result := strings.TrimSpace(string(asOut))
-
-		if result == "OPEN_HELP" {
-			if url := supportURL(); url != "" {
-				openURLAsUser(ctx, uid, currentUser, url)
-			}
-			continue
-		}
-		if result == "ESCAPED" {
-			continue
-		}
-		if !strings.HasPrefix(result, "UPDATE::") {
-			continue
-		}
-
-		userPass := strings.TrimPrefix(result, "UPDATE::")
-		if userPass == "" {
-			continue
-		}
-
-		if !m.verifyUserPassword(ctx, currentUser, userPass) {
-			log.Printf("[WARNING] Incorrect password entered in GUI (Attempt %d).\n", attempt)
-			attempt++
-			continue
-		}
-
-		log.Println("[INFO] Valid GUI password received. Delegating grant to Swift Helper...")
-
-		grantErr := m.grantSecureTokenSilently(ctx, targetUser, targetPass, currentUser, userPass)
-
-		// The AbR session can expire between the pre-check and the grant (or the pre-check passed on a session with seconds left). If the refusal is the admin-membership one, walk the user through AbR and retry the same already-validated password once instead of failing with a generic error.
-		if grantErr != nil && !m.isAdminMember(ctx, currentUser) {
-			log.Printf("[WARNING] Grant refused because %s is not an administrator (Admin By Request rights expired?). Offering an AbR session and retrying...\n", currentUser)
-			if m.ensureAdminViaAbR(ctx, uid, currentUser) {
-				grantErr = m.grantSecureTokenSilently(ctx, targetUser, targetPass, currentUser, userPass)
-			}
-		}
-
-		if grantErr != nil {
-			log.Printf("[ERROR] Swift token grant failed: %v\n", grantErr)
-			m.showErrorMessage(ctx, currentUser, uid)
-			return false
-		}
-
-		successScript := `display dialog "Thank you!" & return & return & "The IT security update has been completed successfully. You can now close this window." buttons {"OK"} default button "OK" with title "GoLAPS - Success" with icon note`
-		successCtx, cancelSuccess := withReserve(ctx, dialogWait, vaultWriteReserve)
-		successCmd := exec.CommandContext(successCtx, "launchctl", "asuser", uid, "osascript")
-		successCmd.Stdin = strings.NewReader(successScript)
-		if err := successCmd.Run(); err != nil {
-			log.Printf("[INFO] Success dialog was not shown or was dismissed: %v\n", err)
-		}
-		cancelSuccess()
-		log.Println("[SUCCESS] GUI Token Grant Successful!")
-		return true
-	}
-
-	m.showFailureMessage(ctx, currentUser, uid)
-	return false
+	outcome, tally := m.askPassword(ctx, uid, currentUser, needAdmin, func(ctx context.Context, userPass string) error {
+		return m.grantSecureTokenSilently(ctx, targetUser, targetPass, currentUser, userPass)
+	})
+	return promptResult{outcome: outcome, user: currentUser, wrongPasswordRuns: tally.wrongPasswordRuns, windowFailedRuns: tally.windowFailedRuns, windowFailed: tally.windowFailed}
 }
 
-// openURLAsUser opens a URL in the console user's GUI session, as that user. BOTH parts are required, and each one alone is broken: - `launchctl asuser <uid>` puts the process in the user's Aqua/bootstrap session, which `open` needs to have a GUI session to hand the URL to — but it does NOT change the uid. The process stays root, so LaunchServices resolves the default browser from *root's* preferences, where none is set, and silently falls back to Safari. Observed in production: with asuser-only the URL opened in Safari with no logged-in session instead of the user's actual default browser. - `sudo -u <user>` alone drops to the user (so LaunchServices reads their default-browser preference and the browser starts with their profile and cookies) but does not enter the Aqua session. Combined, the URL lands in the user's real default browser with their existing session, so a help link resolves without a second sign-in. Running sudo from root needs no password, and Admin By Request's per-session sudo gating applies to non-root callers, not to us.
-func openURLAsUser(ctx context.Context, uid, user, url string) {
-	cmd := exec.CommandContext(ctx, "launchctl", "asuser", uid, "sudo", "-u", user, "open", url)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("[WARNING] Could not open %s in %s's session: %v | output: %s\n", url, user, err, strings.TrimSpace(string(out)))
-	}
-}
-
-// openAppAsUser launches (or, for a single-instance app, re-activates) a GUI app in the console user's session. Same launchctl-asuser + sudo -u pairing as openURLAsUser and for the same reason. Used to raise Admin By Request's "start an administrator session?" prompt, which the adminbyrequest:// URL scheme does not do on its own.
+// openAppAsUser uses both launchctl asuser (Aqua session) and sudo -u (console user identity).
 func openAppAsUser(ctx context.Context, uid, user, appName string) error {
-	cmd := exec.CommandContext(ctx, "launchctl", "asuser", uid, "sudo", "-u", user, "open", "-a", appName)
+	cmd := commandContext(ctx, toolLaunchctl, "asuser", uid, toolSudo, "-u", user, toolOpen, "-a", appName)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		log.Printf("[WARNING] Could not open app %q in %s's session: %v | output: %s\n", appName, user, err, strings.TrimSpace(string(out)))
 		return err
@@ -864,181 +1076,22 @@ func openAppAsUser(ctx context.Context, uid, user, appName string) error {
 	return nil
 }
 
-// isAdminMember reports whether user is currently in the local admin group — the exact property opendirectoryd checks on the authenticating credential before it will enable a SEP credential (its refusal is error 5101 "Credential is not an admin").
 func (m *MacOSManager) isAdminMember(ctx context.Context, user string) bool {
-	out, err := exec.CommandContext(ctx, "dsmemberutil", "checkmembership", "-U", user, "-G", "admin").CombinedOutput()
+	out, err := commandContext(ctx, toolDsmemberutil, "checkmembership", "-U", user, "-G", "admin").CombinedOutput()
 	return err == nil && strings.Contains(string(out), "user is a member")
 }
 
-// ensureAdminViaAbR guides the console user into a temporary Admin By Request session and waits until their admin rights actually appear. Returns true once the user is an admin. This exists because the GUI grant path is otherwise a dead end on AbR-managed Macs: the user's password is correct, but without admin membership opendirectoryd refuses the grant, and the user only saw a generic "unexpected system error". The observed manual fix was an IT person telling them to request AbR access and try again — this automates that.
-func (m *MacOSManager) ensureAdminViaAbR(ctx context.Context, uid, user string) bool {
-	if _, err := os.Stat(abrAppPath); err != nil {
-		log.Printf("[WARNING] %s is not an administrator and Admin By Request is not installed — the token grant cannot succeed on this Mac.\n", user)
-		return false
-	}
-
-	log.Printf("[INFO] %s is not an administrator (Admin By Request manages rights on this Mac). Asking the user to request a temporary admin session...\n", user)
-
-	// No Cancel button, by design — the same as the password prompt. The update cannot proceed without admin rights, so the only ways out are "get admin" or the wait-window timeout. Escape (osascript "on error") is therefore NOT a cancel: we open Admin By Request anyway.
-	helpButton := ""
-	if supportURL() != "" {
-		helpButton = `"Open Help", `
-	}
-	abrScript := fmt.Sprintf(`
-	try
-		set dialogText to "Your organization is finishing a security update, and it needs you to hold temporary administrator rights for a moment.\n\nClick \"Open Admin By Request\", choose Request administrator access, confirm with Yes, and leave this window — it continues automatically once access is granted.\n\nIf you want to verify this request, contact your IT support team."
-		set result to display dialog dialogText buttons {%s"Open Admin By Request"} default button "Open Admin By Request" with title "GoLAPS - Admin Access Needed" with icon caution
-		return button returned of result
-	on error
-		return "ESCAPED"
-	end try`, helpButton)
-
-	dialogCtx, cancelDialog := withReserve(ctx, dialogWait, vaultWriteReserve)
-	abrCmd := exec.CommandContext(dialogCtx, "launchctl", "asuser", uid, "osascript")
-	abrCmd.Stdin = strings.NewReader(abrScript)
-	abrOut, abrErr := abrCmd.Output()
-	cancelDialog()
-
-	if abrErr != nil {
-		// The dialog never reached the user (no GUI session, osascript blocked, budget gone). Waiting out the poll window here would park the device's MDM script slot on a prompt nobody ever saw, so give up now and retry on the next check-in.
-		log.Printf("[WARNING] Could not show the Admin By Request prompt to %s: %v. Not waiting for an admin session.\n", user, abrErr)
-		return false
-	}
-
-	if strings.TrimSpace(string(abrOut)) == "Open Help" {
-		if url := supportURL(); url != "" {
-			openURLAsUser(ctx, uid, user, url)
-		}
-	}
-	// Every path leads here: raise Admin By Request's session prompt and wait. `open -a` re-activates the single-instance agent, which surfaces its "start an administrator session?" window — the URL scheme alone does not.
-	if err := openAppAsUser(ctx, uid, user, abrAppName); err != nil {
-		log.Printf("[WARNING] Admin By Request could not be raised for %s; not waiting for an admin session.\n", user)
-		return false
-	}
-
-	// Poll until the AbR approval lands ("Added user to admin group" in its log). Approval can involve a human, so we wait a while; ctx still caps the whole interaction.
-	waitCtx, cancelWait := withReserve(ctx, abrWaitWindow, vaultWriteReserve)
-	defer cancelWait()
-
-	for waitCtx.Err() == nil {
-		select {
-		case <-waitCtx.Done():
-		case <-time.After(abrPollInterval):
-		}
-		if m.isAdminMember(ctx, user) {
-			log.Printf("[SUCCESS] %s obtained admin rights via Admin By Request. Continuing.\n", user)
-			return true
-		}
-	}
-
-	log.Printf("[WARNING] %s did not obtain admin rights within %s. Grant aborted; will retry on the next MDM check-in.\n", user, abrWaitWindow)
-	return false
-}
-
-// showErrorMessage reports a failed grant. Like the password prompt, it offers a clickable help route when LAPS_SUPPORT_URL is set: a plain-text pointer behind a lone OK button leaves the user nothing to click and nowhere to verify the request.
-func (m *MacOSManager) showErrorMessage(ctx context.Context, currentUser, uid string) {
-	// A dialog waits for a human, so it gets a generous cap — but never at the cost of the vault write still queued behind it.
-	ctx, cancel := withReserve(ctx, dialogWait, vaultWriteReserve)
-	defer cancel()
-
-	helpButton := ""
-	defaultButton := "OK"
-	if supportURL() != "" {
-		helpButton = `"Open Help", `
-		defaultButton = "Open Help"
-	}
-	errScript := fmt.Sprintf(`
-	try
-		set dialogText to "An unexpected system error occurred while applying the security update." & return & return & "Please contact your IT support team."
-		set result to display dialog dialogText buttons {%s"OK"} default button "%s" with title "GoLAPS - Error" with icon caution
-		return button returned of result
-	on error
-		return "CANCELLED"
-	end try`, helpButton, defaultButton)
-
-	errCmd := exec.CommandContext(ctx, "launchctl", "asuser", uid, "osascript")
-	errCmd.Stdin = strings.NewReader(errScript)
-	errOut, _ := errCmd.Output()
-
-	if strings.TrimSpace(string(errOut)) == "Open Help" {
-		if url := supportURL(); url != "" {
-			openURLAsUser(ctx, uid, currentUser, url)
-		}
-	}
-}
-
-func (m *MacOSManager) showFailureMessage(ctx context.Context, currentUser, uid string) {
-	ctx, cancel := withReserve(ctx, dialogWait, vaultWriteReserve)
-	defer cancel()
-
-	helpButton := ""
-	defaultButton := "OK"
-	if supportURL() != "" {
-		helpButton = `"Open Help", `
-		defaultButton = "Open Help"
-	}
-	failScript := fmt.Sprintf(`
-	try
-		set dialogText to "It looks like you may have forgotten your Mac login password.\n\nThis security update cannot proceed. Please contact your IT support team for assistance."
-		set result to display dialog dialogText buttons {%s"OK"} default button "%s" with title "GoLAPS - Update Failed" with icon stop
-		return button returned of result
-	on error
-		return "CANCELLED"
-	end try`, helpButton, defaultButton)
-
-	failCmd := exec.CommandContext(ctx, "launchctl", "asuser", uid, "osascript")
-	failCmd.Stdin = strings.NewReader(failScript)
-	failOut, _ := failCmd.Output()
-
-	if strings.TrimSpace(string(failOut)) == "Open Help" {
-		if url := supportURL(); url != "" {
-			openURLAsUser(ctx, uid, currentUser, url)
-		}
-	}
-}
-
-func (m *MacOSManager) generateAppleScript(attempt, maxAttempts int) string {
-	var dialogText string
-	if attempt == 1 {
-		dialogText = "Your organization is updating macOS security configurations.\\n\\nWe are deploying a new background IT account to help with FileVault data recovery. To complete this automated process, macOS requires your local login password.\\n\\nIf you want to verify this request, contact your IT support team.\\n\\nPlease enter your Mac login password to proceed:"
-	} else {
-		dialogText = fmt.Sprintf("Incorrect password. Please try again. (Attempt %d of %d)\\n\\nReminder: this is a verified IT update — contact your IT support team to confirm.\\n\\nPlease enter your Mac login password:", attempt, maxAttempts)
-	}
-
-	buttons := `{"Update"}`
-	if supportURL() != "" {
-		buttons = `{"Open Help", "Update"}`
-	}
-
-	return fmt.Sprintf(`
-	try
-		set dialogText to "%s"
-		set result to display dialog dialogText default answer "" with hidden answer buttons %s default button "Update" with title "GoLAPS - Security Update" with icon caution
-
-		if button returned of result is "Open Help" then
-			return "OPEN_HELP"
-		else
-			return "UPDATE::" & text returned of result
-		end if
-	on error
-		return "ESCAPED"
-	end try
-	`, dialogText, buttons)
-}
-
 func (m *MacOSManager) DeleteServiceAccountToken(ctx context.Context) error {
-	log.Println("[SECURITY] Shredding the vault token from the Keychain...")
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "security", "delete-generic-password", "-l", "GoLAPS_Vault_Token", "/Library/Keychains/System.keychain")
+	cmd := commandContext(ctx, toolSecurity, "delete-generic-password", "-l", "GoLAPS_Vault_Token", "/Library/Keychains/System.keychain")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
+		log.Println("[SECURITY] Removed leftover vault token from System Keychain.")
 		return nil
 	}
-	// Nothing to shred is the expected outcome of a manual run that took the token from the environment instead of the keychain — not worth alarming an operator over.
 	if strings.Contains(string(out), "could not be found") {
-		log.Println("[INFO] No token was present in the Keychain; nothing to shred.")
 		return nil
 	}
 	return fmt.Errorf("could not delete the keychain token: %w | output: %s", err, strings.TrimSpace(string(out)))

@@ -1,5 +1,5 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 package password
 
@@ -34,7 +34,6 @@ func TestGenerateLength(t *testing.T) {
 	}
 }
 
-// The MDM requireAlphanumeric policy rejects a password without all three classes with Code=5402, so this property is the whole reason the generator loops.
 func TestGenerateAlwaysMeetsComplexityPolicy(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		got, err := Generate(MinLength)
@@ -53,7 +52,31 @@ func TestGenerateAlwaysMeetsComplexityPolicy(t *testing.T) {
 	}
 }
 
-// The password crosses AppleScript string literals, shell wrappers and sysadminctl argument lists. A quote, backtick or backslash slipping into the charset would break one of them in a way that only shows up on the device that drew the unlucky character.
+func TestGenerateLimitsSymbols(t *testing.T) {
+	seenCounts := map[int]bool{}
+	for i := 0; i < 1000; i++ {
+		got, err := Generate(DefaultLength)
+		if err != nil {
+			t.Fatalf("Generate returned an error: %v", err)
+		}
+		count := 0
+		for _, c := range got {
+			if strings.ContainsRune(symbols, c) {
+				count++
+			}
+		}
+		if count < MinSymbols || count > MaxSymbols {
+			t.Fatalf("password %q has %d symbols, want between %d and %d", got, count, MinSymbols, MaxSymbols)
+		}
+		seenCounts[count] = true
+	}
+	for n := MinSymbols; n <= MaxSymbols; n++ {
+		if !seenCounts[n] {
+			t.Errorf("no password with %d symbols in 1000 draws", n)
+		}
+	}
+}
+
 func TestGenerateUsesOnlySafeCharacters(t *testing.T) {
 	const forbidden = "\"'`\\ \t\n"
 
@@ -92,12 +115,12 @@ func TestViolatesAllowSimple(t *testing.T) {
 		pw   string
 		want bool
 	}{
-		{"aab8Xk3pQm9RtY2w", true},  // doubled character
-		{"abc8Xk3pQm9RtY2w", true},  // ascending run
-		{"cba8Xk3pQm9RtY2w", true},  // descending run
-		{"a1b2C3d4E5f6G7h8", false}, // clean
-		{"X123kPmQ9RtY2wJn", true},  // ascending digits
-		{"aXbYcZ8k3p9q2w4e", false}, // letters interleaved, no runs
+		{"aab8Xk3pQm9RtY2w", true},
+		{"abc8Xk3pQm9RtY2w", true},
+		{"cba8Xk3pQm9RtY2w", true},
+		{"a1b2C3d4E5f6G7h8", false},
+		{"X123kPmQ9RtY2wJn", true},
+		{"aXbYcZ8k3p9q2w4e", false},
 	}
 	for _, tt := range tests {
 		if got := violatesAllowSimple([]byte(tt.pw)); got != tt.want {
@@ -106,7 +129,6 @@ func TestViolatesAllowSimple(t *testing.T) {
 	}
 }
 
-// A passcode profile with allowSimple=false evaluates every rotated password; a single violating sample means roughly 1 in 4 rotations on affected Macs fails with OD 5402 and recreates a healthy admin.
 func TestGenerateSatisfiesAllowSimple(t *testing.T) {
 	for i := 0; i < 500; i++ {
 		pw, err := Generate(DefaultLength)

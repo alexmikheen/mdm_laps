@@ -1,146 +1,90 @@
 # Architecture
 
-GoLAPS rotates a managed local administrator password and escrows it to a vault. The design is
-shaped by one constraint: **a rotation is irreversible, and the vault holds the only copy of the
-result.** Every ordering decision below follows from that.
+GoLAPS rotates a managed local administrator password and stores it in a vault. One rule drives the design: **a rotation is irreversible, and the vault holds the only copy of the new password.** Every ordering choice below follows that rule.
 
-## Safety ordering (the orchestrator)
+## Safety Ordering (Orchestrator)
 
-`internal/core/orchestr.go` runs one rotation as a strict sequence:
+`internal/core/orchestr.go` runs each rotation in a strict sequence:
 
-1. **Read the vault record.** If it cannot be read, the run aborts — a vault we cannot read is
-   very likely a vault we cannot write, and rotating without a reliable escrow is how a device
-   ends up with a password nobody knows.
-2. **Stage the new password in the vault BEFORE touching the device** (`field_pending_password` /
-   `pending_password`). If the device is rotated first and the confirming write fails, the working
-   password is gone. Staging first also proves the service account still has write access before
-   anything irreversible happens.
-3. **Rotate,** starting with the best candidate (see *Candidate order* below).
-4. **Grant / verify the Secure Token** (macOS; see below).
-5. **Commit the rotated password** to the vault. The confirming write drops the staged copy —
-   committing the real password *is* the retirement of the pending field.
+1. **Read the vault record.** If GoLAPS cannot read the vault, the run stops. A vault you cannot read likely blocks writes as well, and rotating without escrow leaves an unknown password on the device.
+2. **Stage the new password in the vault before touching the device.** GoLAPS writes the new password to `field_pending_password` (1Password) or `pending_password` (key-value providers). If the final write fails later, the working password remains recoverable. Staging first also checks write access before any OS change.
+3. **Rotate the local account password.** GoLAPS tries candidates in priority order (see *Candidate Order*).
+4. **Grant and check the Secure Token (macOS).** GoLAPS ensures the managed admin can unlock FileVault.
+5. **Commit the rotated password to the vault.** The final write clears the staged field and saves the active password.
 
-A run whose rotation succeeded but whose token grant failed still commits the password (step 5
-comes first), then exits non-zero: without a Secure Token the account cannot unlock FileVault, and
-exiting 0 is what makes an MDM report "Pass" for devices with no working recovery account.
+If rotation succeeds but the Secure Token grant fails, GoLAPS still commits the password first and then exits non-zero. Without a Secure Token, the account cannot unlock FileVault. Exiting `0` would make MDM report a healthy recovery account when none exists.
 
-### Candidate order
+### Candidate Order
 
-A staged password surviving from an earlier run means that run died *between* rotating the device
-and confirming the vault — and in every observed failure of that kind the device already held the
-staged value. So the rotation starts with the pending password, keeps the recorded password as the
-alternate candidate (one extra helper call), and only then falls back to the optional legacy
-password. Recreation is the last resort: it costs the Secure Token and a user prompt.
+A leftover staged password means an earlier run stopped between rotating the device and committing to the vault. In that state, the device may already hold the staged value.
 
-### Policy-rejected passwords
+GoLAPS checks stored candidates (`pending_password`, `previous_pending_password`, and the current password) and starts rotation with the matching one. It then falls back to the optional legacy password. Account recreation runs only as a last resort, because it costs the Secure Token and triggers a user prompt.
 
-If the device's password policy refuses the *new* password (OpenDirectory 5402–5407: quality,
-length, character classes, change-too-soon), the account is healthy and recreation would destroy a
-working admin over a dice roll. The run reports the failure, **clears the staged copy** (it
-provably never reached the device — leaving it would make the next run try a known-refused value
-as the current password), and the next run retries with a fresh password. The generator also
-avoids the common `allowSimple=false` traps up front: no doubled characters, no three-character
-ascending/descending runs.
+### Policy-Rejected Passwords
 
-### Network failures
+The device password policy can refuse the new password (OpenDirectory errors `5402`–`5407`). In that case, the account is healthy, so GoLAPS must not recreate it.
 
-Connectivity failures to the vault are tagged with a `[NETWORK]` marker in the log. There is
-nothing to fix on the device — the run simply retries on the next MDM check-in once connectivity
-returns.
+The run reports the failure and clears the staged copy because the device never accepted it. The next run generates a fresh password and retries. The generator also avoids `allowSimple=false` failures by blocking doubled characters and three-character runs.
 
-## The Go ↔ Swift contract (macOS)
+### Network Failures
 
-The privileged OpenDirectory work lives in a small Swift helper (`mac_helper`), driven by JSON on
-stdin. The contract is: **the helper reports, Go decides.**
+GoLAPS tags vault connectivity failures with `[NETWORK]` in the log. No local change is necessary. The run retries on the next MDM check-in after connectivity returns.
 
-`change_password` exits with a structured outcome:
+## The Go and Swift Contract (macOS)
 
-| Exit | Meaning | Go's decision |
-|------|---------|---------------|
-| 0 | ok | continue |
-| 1 | od-error | report |
-| 2 | auth-failed | try the alternate candidate, then recreate |
-| 3 | locked (OD 5305) | recreate |
-| 4 | reset-refused | report — never claimed as success |
-| 5 | policy-rejected (OD 5402–5407) | report + clear the staged password; **never** recreate |
+A small Swift helper (`mac_helper`) runs privileged OpenDirectory and `sysadminctl` actions. Go drives it over JSON on `stdin`. The contract is simple: **the helper reports outcomes, and Go decides policy.**
 
-Two hard-won rules are encoded in the helper:
+`change_password` exits with a structured status code:
 
-- **Phantom resets are detected by output, not exit code.** `sysadminctl -resetPasswordFor` can
-  exit 0 while opendirectoryd refuses the reset ("Operation is not permitted without secure token
-  unlock"). The helper captures the process output and treats the refusal markers as failure
-  regardless of the exit status. This is the single most important behavior in the project: a
-  phantom reset escrows a password the device never received, silently desynchronizing the device
-  from the vault while every run shows green.
-- **Token holders are never administratively reset.** `AllowAdminReset` is true only for an
-  account that provably holds no Secure Token (e.g. one created seconds ago). On a token holder an
-  administrative reset either phantoms (above) or succeeds while breaking the SEP/FileVault chain —
-  the token still shows ENABLED but no longer unlocks the volume at preboot.
+| Exit | Meaning | Go Decision |
+|------|---------|-------------|
+| 0 | `ok` | Continue |
+| 1 | `od-error` | Report error |
+| 2 | `auth-failed` | Try the next candidate, then recreate |
+| 3 | `locked` (OD 5305) | Recreate |
+| 4 | `reset-refused` | Report error and never treat as success |
+| 5 | `policy-rejected` (OD 5402–5407) | Report error, clear staged password, and never recreate |
 
-All secrets travel over stdin — never in argv. The one place a password must appear in an argument
-list (`dscl . -passwd` during the last-resort account build) uses a throwaway value that is rotated
-to the real password over stdin immediately afterwards.
+The helper enforces two strict rules:
 
-A cross-language contract test parses the Swift enum's raw values out of `mac_helper.swift` and
-compares them with the Go constants, so the two sides cannot drift silently.
+- **Detect phantom resets by output, not exit code.** `sysadminctl -resetPasswordFor` can exit `0` while `opendirectoryd` refuses the reset ("Operation is not permitted without secure token unlock"). The helper captures output and treats refusal markers as failure regardless of exit status. Without this check, a phantom reset stores a password the device never accepted.
+- **Never administratively reset a Secure Token holder.** Go sets `AllowAdminReset` to `true` only when the account holds no Secure Token. On a token holder, an administrative reset either causes a phantom reset or breaks the SEP and FileVault chain.
 
-## The heal ladder
+GoLAPS sends all secrets over `stdin`, never in `argv`. In the last-resort `dscl` account-creation path, `dscl . -passwd` uses a throwaway value that GoLAPS rotates immediately over `stdin`.
 
-When the account is unusable (no token, or locked beyond every soft repair), Go recreates it:
+A cross-language contract test parses the Swift enum raw values from `mac_helper.swift` and compares them with the Go constants.
 
-1. `sysadminctl -deleteUser` — the supported path, protected by macOS's last-admin guard.
-2. If the guard refuses (the target is the last admin — common where a privilege-management tool
-   demotes human admins), a **temporary bridge admin** (`laps-bridge`) is created to hold the admin
-   count, the target is deleted and recreated *inside* the bridge window, and the bridge is retired
-   once the target holds a Secure Token. The bridge never needs a token — the guard counts admins.
-3. Account creation is verified afterwards; a "create-phantom" (sysadminctl exits 0, account does
-   not exist) is retried through an OpenDirectory cache reset, and as a last resort the record is
-   assembled directly via `dscl` — a path that at least fails loudly and names the reason.
+## The Heal Ladder
 
-Never `dscl . -delete` an account directly: it bypasses the last-admin guard, orphans the SEP
-identity, and leaves a tombstone that makes every later `sysadminctl -addUser` for that name exit 0
-without creating anything.
+When the account has no Secure Token or stays locked after every soft fix, Go recreates it:
 
-## Secure Token management
+1. Run `sysadminctl -deleteUser`. macOS protects this command with its last-admin guard.
+2. If the guard refuses because the target is the last admin, Go creates a temporary bridge admin (`laps-bridge`) after escrowing its password. Go deletes and recreates the target inside that window, then deletes `laps-bridge` after the target holds a Secure Token.
+3. Go checks that the new account exists. If `sysadminctl` exited `0` without creating the record (a create-phantom), Go resets the OpenDirectory cache and retries. As a last resort, Go builds the record with `dscl` so any failure reports a clear reason.
 
-After rotation, `ManageSecureToken` works through candidates in cost order: verify the token is
-already present → silent grants using every vault-known credential of every actual token holder
-(enumerated via per-account `sysadminctl -secureTokenStatus`, *not* `fdesetup list`, which reports
-FileVault-enabled users — a different set) → the interactive GUI prompt (see
-[admin-by-request.md](admin-by-request.md)).
+Never run `dscl . -delete` on an account. It bypasses the last-admin guard, orphans the SEP identity, and leaves a tombstone that breaks later `sysadminctl -addUser` calls.
 
-A failed grant is a failed run. The one softening: if a personal recovery key exists locally
-**and** the bootstrap token is escrowed, the failure reports as `DISABLED (MDM recovery covered)` —
-a warning, not a red status — because the MDM still has a FileVault recovery path. Coverage changes
-only how the failure *reports*: the prompt runs again on every check-in until the token lands, and
-a token-less service admin is never an accepted end state. Both coverage probes fail closed.
+## Secure Token Management
 
-## Vault behavior
+After rotation, `ManageSecureToken` follows cost order:
 
-- **Retries with jitter.** Vault writes are retried (5 attempts, linear backoff plus random
-  jitter). The jitter matters at fleet scale: a synchronized rollout makes hundreds of devices
-  collide on the same backoff grid and conflict again on every retry.
-- **Read-modify-write inside the retry.** A timed-out write can still land server-side; re-sending
-  the same stale item then fails every remaining attempt with a version conflict. Each attempt
-  re-reads the item first.
-- **Duplicate titles resolve to the newest item.** Taking the first match can hand back a
-  months-old password.
-- **The run budget.** MDM platforms commonly hard-kill a custom script around 60 minutes. The whole
-  run shares one deadline set below that, and every user-facing dialog reserves a slice of the
-  budget for the final vault write, so a human staring at a prompt can never push the run past the
-  kill limit with the rotated password unrecorded.
+1. Check whether the target already holds a Secure Token.
+2. Try silent grants using vault-known credentials for local token holders (found with `sysadminctl -secureTokenStatus`, not `fdesetup list`).
+3. Open the native SwiftUI window (`golaps_auth`) for the console user (see [admin-by-request.md](admin-by-request.md)).
 
-## Capabilities handshake
+A failed grant fails the run. If a personal recovery key exists locally and MDM holds a bootstrap token, GoLAPS reports `DISABLED (MDM recovery covered)`. That status logs a warning instead of a hard failure because MDM still holds a FileVault recovery path. Coverage changes only the report status: the prompt still runs on the next check-in until the account gets a Secure Token. Both coverage checks fail closed.
 
-`golaps --capabilities` prints a space-separated feature list
-(`recreate-locked structured-outcome verified-reset last-admin-bridge bt-aware`) before any
-config/vault/keychain work. The MDM wrapper script gates its handover on the flags it needs instead
-of comparing version numbers — an older binary prints nothing and exits non-zero, which reads as
-"cannot", the safe direction.
+## Vault Behavior
+
+- **Retries with jitter.** GoLAPS retries vault writes up to 5 times with linear backoff and random jitter. Jitter stops fleet-wide rollouts from colliding on the same retry schedule.
+- **Read-change-write inside the retry.** A timed-out write can still land on the server. Each retry reads the latest item first so stale writes do not cause version conflicts.
+- **Duplicate titles resolve to the newest item.** Picking the first match can return an outdated password.
+- **Shared run budget.** MDM platforms often kill scripts after 60 minutes. GoLAPS shares one deadline below that limit and reserves time for the final vault write. An idle user prompt cannot push the run past the kill limit before GoLAPS saves the rotated password.
+
+## Capabilities Handshake
+
+`golaps --capabilities` prints a space-separated feature list (`recreate-locked structured-outcome verified-reset last-admin-bridge bt-aware`) before any configuration or vault work. The MDM wrapper script checks these flags instead of comparing version numbers. An older binary prints nothing and exits non-zero, which fails safe.
 
 ## Logging
 
-Runs log to stdout (the MDM captures it) and, on macOS, to `/Library/Logs/golaps.log` — tail-capped
-at 2000 lines by both the wrapper and the binary. Most MDMs keep only the latest run per device, so
-the local file is the only run history that survives. Helper output is scrubbed against every
-secret the payload carried before it is logged.
+GoLAPS logs to `stdout` for MDM capture and, on macOS, to `/Library/Logs/golaps.log`. Both the wrapper and the binary cap that log at 2000 lines because most MDMs keep only the latest run. GoLAPS scrubs all payload secrets from helper output before it logs any line.

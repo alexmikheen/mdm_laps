@@ -1,5 +1,5 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 package password
 
@@ -14,40 +14,38 @@ const (
 	lower  = "abcdefghijklmnopqrstuvwxyz"
 	upper  = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	digits = "0123456789"
-	// No quotes, backticks or backslashes: the generated password crosses AppleScript, shell wrappers and sysadminctl argument lists, and every one of those has its own quoting rules.
+	// The symbol set has no quotes, backticks, or backslashes so passwords pass safely through shell wrappers and OS tooling.
 	symbols = "!@#$%^&*()-_=+[]{}|;:,.<>/?"
 
-	allChars = lower + upper + digits + symbols
+	alphanumerics = lower + upper + digits
+	allChars      = alphanumerics + symbols
 
-	// MinLength mirrors a 16+ character floor typical of corporate access-control policies.
+	// MinLength is the minimum accepted password length.
 	MinLength = 16
-	// DefaultLength is used when the caller asks for anything shorter than MinLength.
+	// DefaultLength applies when the caller asks for a length below MinLength.
 	DefaultLength = 18
+
+	// Limit symbols to 1-3 so admins can type passwords at the FileVault pre-boot screen.
+	MinSymbols = 1
+	MaxSymbols = 3
 )
 
-// Generate creates a cryptographically secure password of the specified length. It loops until the generated password contains at least one lowercase letter, one uppercase letter, and one digit to satisfy MDM complexity policies. An exhausted entropy source is returned as an error rather than ending the process: this runs after the vault has been read and the caller owns the shutdown path (log flushing, exit code), which a log.Fatal here used to bypass.
+// Generate returns a random password with all four character classes that satisfies macOS allowSimple=false.
 func Generate(length int) (string, error) {
 	if length < MinLength {
 		length = DefaultLength
 	}
 
-	// We use a loop to "generate and validate". It will keep generating new passwords in milliseconds until one perfectly matches the complexity rules.
 	for {
-		result := make([]byte, length)
+		result, err := draw(length)
+		if err != nil {
+			return "", err
+		}
+
 		hasLower := false
 		hasUpper := false
 		hasDigit := false
-
-		for i := range result {
-			num, err := rand.Int(rand.Reader, big.NewInt(int64(len(allChars))))
-			if err != nil {
-				// Fail safely requirement
-				return "", fmt.Errorf("critical failure in random number generator: %w", err)
-			}
-			char := allChars[num.Int64()]
-			result[i] = char
-
-			// Check which character pools were used
+		for _, char := range result {
 			if strings.ContainsRune(lower, rune(char)) {
 				hasLower = true
 			} else if strings.ContainsRune(upper, rune(char)) {
@@ -57,15 +55,59 @@ func Generate(length int) (string, error) {
 			}
 		}
 
-		// MDM Policy check: Must contain alphanumeric characters. We enforce at least 1 lower, 1 upper, and 1 digit to be bulletproof.
+		// MDM requireAlphanumeric rejects a password without all three classes with OD 5402.
 		if hasLower && hasUpper && hasDigit && !violatesAllowSimple(result) {
 			return string(result), nil
 		}
-		// If it fails the complexity check, the loop seamlessly restarts.
 	}
 }
 
-// violatesAllowSimple reports whether the password would fail macOS's allowSimple=false policy check: two identical characters in a row, or three characters in an ascending/descending run. A passcode profile with allowSimple=false enforces it, and a purely random 18-char password carries a doubled character roughly a quarter of the time — observed in production, each such rotation came back as OD 5402 and, worse, read as auth-failed, which recreated a healthy admin.
+// draw fills the password with random alphanumerics, then replaces MinSymbols to MaxSymbols random positions with random symbols.
+func draw(length int) ([]byte, error) {
+	result := make([]byte, length)
+	for i := range result {
+		idx, err := randomIndex(len(alphanumerics))
+		if err != nil {
+			return nil, err
+		}
+		result[i] = alphanumerics[idx]
+	}
+
+	count, err := randomIndex(MaxSymbols - MinSymbols + 1)
+	if err != nil {
+		return nil, err
+	}
+	count += MinSymbols
+
+	// Pick distinct positions with a partial Fisher-Yates shuffle so two symbols never land on the same index.
+	positions := make([]int, length)
+	for i := range positions {
+		positions[i] = i
+	}
+	for i := 0; i < count; i++ {
+		j, err := randomIndex(length - i)
+		if err != nil {
+			return nil, err
+		}
+		positions[i], positions[i+j] = positions[i+j], positions[i]
+		idx, err := randomIndex(len(symbols))
+		if err != nil {
+			return nil, err
+		}
+		result[positions[i]] = symbols[idx]
+	}
+	return result, nil
+}
+
+func randomIndex(n int) (int, error) {
+	num, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	if err != nil {
+		return 0, fmt.Errorf("critical failure in random number generator: %w", err)
+	}
+	return int(num.Int64()), nil
+}
+
+// violatesAllowSimple checks macOS allowSimple=false (no doubled characters or 3-character runs).
 func violatesAllowSimple(password []byte) bool {
 	for i := 1; i < len(password); i++ {
 		if password[i] == password[i-1] {

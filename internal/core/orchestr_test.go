@@ -1,5 +1,5 @@
 // Copyright 2026 Aleksandr Mikheenko
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
 package core
 
@@ -7,15 +7,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
 	"golaps/internal/config"
 	"golaps/internal/osmgmt"
 	"golaps/internal/vault"
+	"golaps/internal/version"
 )
 
-// recorder captures the order in which the orchestrator touched the device and the vault. The ordering is the point: escrow must happen before the irreversible rotation.
 type recorder struct {
 	calls []string
 }
@@ -32,22 +33,39 @@ func (r *recorder) indexOf(step string) int {
 }
 
 type fakeManager struct {
-	rec         *recorder
-	seenAlt     string
-	seenOld     string
+	rec *recorder
+	seenCandidates []string
+	sysInfoErr  error
 	rotateErr   error
 	tokenStatus string
 	rotatedPass string
+	cleanupAbsent bool
+	escrow        osmgmt.BridgeEscrow
+	seenCreds map[string]string
+	verifyLive   map[string]bool
+	verifyErr    error
+	seenVerified []string
 }
 
-func (f *fakeManager) GetSystemInfo(ctx context.Context) (string, string) {
+func (f *fakeManager) VerifyPassword(ctx context.Context, user, pass string) (bool, error) {
+	f.rec.record("VerifyPassword")
+	f.seenVerified = append(f.seenVerified, pass)
+	if f.verifyErr != nil {
+		return false, f.verifyErr
+	}
+	return f.verifyLive[pass], nil
+}
+
+func (f *fakeManager) GetSystemInfo(ctx context.Context) (string, string, error) {
 	f.rec.record("GetSystemInfo")
-	return "MAC-001", "SERIAL123"
+	if f.sysInfoErr != nil {
+		return "MAC-001", "", f.sysInfoErr
+	}
+	return "MAC-001", "SERIAL123", nil
 }
 
-func (f *fakeManager) EnsureUserAndChangePassword(ctx context.Context, user, oldPass, altOldPass, newPass string) error {
-	f.seenAlt = altOldPass
-	f.seenOld = oldPass
+func (f *fakeManager) EnsureUserAndChangePassword(ctx context.Context, user string, candidates []string, newPass string) error {
+	f.seenCandidates = candidates
 	f.rec.record("EnsureUserAndChangePassword")
 	f.rotatedPass = newPass
 	return f.rotateErr
@@ -55,6 +73,7 @@ func (f *fakeManager) EnsureUserAndChangePassword(ctx context.Context, user, old
 
 func (f *fakeManager) ManageSecureToken(ctx context.Context, targetUser, newPass string, availableCreds map[string]string) string {
 	f.rec.record("ManageSecureToken")
+	f.seenCreds = availableCreds
 	if f.tokenStatus == "" {
 		return "ENABLED (Silent - Vault)"
 	}
@@ -62,6 +81,21 @@ func (f *fakeManager) ManageSecureToken(ctx context.Context, targetUser, newPass
 }
 
 func (f *fakeManager) DeleteServiceAccountToken(ctx context.Context) error { return nil }
+
+func (f *fakeManager) Preflight(ctx context.Context, user, probeURL string) error {
+	f.rec.record("Preflight")
+	return nil
+}
+
+func (f *fakeManager) CleanupLegacyAdmin(ctx context.Context, targetUser string) bool {
+	f.rec.record("CleanupLegacyAdmin")
+	return f.cleanupAbsent
+}
+
+func (f *fakeManager) SetBridgeEscrow(escrow osmgmt.BridgeEscrow) {
+	f.rec.record("SetBridgeEscrow")
+	f.escrow = escrow
+}
 
 type fakeVault struct {
 	rec        *recorder
@@ -72,6 +106,22 @@ type fakeVault struct {
 	stagedPass string
 	savedPass  string
 	savedToken string
+	bridgePass string
+	bridgeErr  error
+	confirmedLive string
+	confirmErr    error
+}
+
+func (f *fakeVault) ConfirmLivePassword(ctx context.Context, creds *vault.Credentials, deviceID, hostname, vaultID, login, live string) error {
+	f.rec.record("ConfirmLivePassword")
+	f.confirmedLive = live
+	if f.confirmErr != nil {
+		return f.confirmErr
+	}
+	creds.OldPassword = live
+	creds.PendingPassword = ""
+	creds.PreviousPendingPassword = ""
+	return nil
 }
 
 func (f *fakeVault) GetCredentials(ctx context.Context, deviceID, vaultID, targetAdmin string) (*vault.Credentials, error) {
@@ -100,8 +150,21 @@ func (f *fakeVault) ClearPendingPassword(ctx context.Context, creds *vault.Crede
 	return nil
 }
 
+func (f *fakeVault) StageBridgePassword(ctx context.Context, creds *vault.Credentials, vaultID, password string) error {
+	f.rec.record("StageBridgePassword")
+	f.bridgePass = password
+	creds.BridgePassword = password
+	return f.bridgeErr
+}
+
+func (f *fakeVault) ClearBridgePassword(ctx context.Context, creds *vault.Credentials, vaultID string) error {
+	f.rec.record("ClearBridgePassword")
+	creds.BridgePassword = ""
+	return nil
+}
+
 func testConfig() *config.Config {
-	return &config.Config{AdminUser: "lapsadmin", VaultID: "vault1", PassLength: 18}
+	return &config.Config{AdminUser: "localadmin", VaultID: "vault1", PassLength: 18}
 }
 
 func TestRunLAPSHappyPath(t *testing.T) {
@@ -121,7 +184,6 @@ func TestRunLAPSHappyPath(t *testing.T) {
 	}
 }
 
-// The rotation is irreversible and the vault holds the only copy of the result, so the escrow must be written first. Reversing these two is what leaves a device with a password nobody has.
 func TestRunLAPSEscrowsBeforeRotating(t *testing.T) {
 	rec := &recorder{}
 	mgr := &fakeManager{rec: rec}
@@ -144,7 +206,7 @@ func TestRunLAPSEscrowsBeforeRotating(t *testing.T) {
 func TestRunLAPSAbortsWhenVaultCannotBeRead(t *testing.T) {
 	rec := &recorder{}
 	mgr := &fakeManager{rec: rec}
-	v := &fakeVault{rec: rec, getErr: errors.New("vault unreachable")}
+	v := &fakeVault{rec: rec, getErr: errors.New("1Password unreachable")}
 
 	err := RunLAPS(context.Background(), testConfig(), mgr, v)
 	if err == nil {
@@ -171,7 +233,7 @@ func TestRunLAPSAbortsWhenEscrowFails(t *testing.T) {
 
 func TestRunLAPSDoesNotSyncVaultWhenRotationFails(t *testing.T) {
 	rec := &recorder{}
-	mgr := &fakeManager{rec: rec, rotateErr: errors.New("sysadminctl refused")}
+	mgr := &fakeManager{rec: rec, rotateErr: errors.New("localadminminctl refused")}
 	v := &fakeVault{rec: rec}
 
 	err := RunLAPS(context.Background(), testConfig(), mgr, v)
@@ -183,7 +245,6 @@ func TestRunLAPSDoesNotSyncVaultWhenRotationFails(t *testing.T) {
 	}
 }
 
-// Without a Secure Token the account cannot unlock FileVault. The password must still be escrowed (otherwise the device is unreachable), but the run has to end non-zero — reporting success here is what made the MDM show "Pass" for devices left with no recovery account.
 func TestRunLAPSFailsButStillEscrowsWhenTokenGrantFails(t *testing.T) {
 	rec := &recorder{}
 	mgr := &fakeManager{rec: rec, tokenStatus: "DISABLED (Review Required)"}
@@ -209,6 +270,19 @@ func TestRunLAPSFailsButStillEscrowsWhenTokenGrantFails(t *testing.T) {
 	}
 }
 
+func TestRunLAPSRetiresLegacyAdminOnlyAfterVaultWrite(t *testing.T) {
+	rec := &recorder{}
+	mgr := &fakeManager{rec: rec, tokenStatus: "DISABLED (Review Required)"}
+	v := &fakeVault{rec: rec}
+
+	_ = RunLAPS(context.Background(), testConfig(), mgr, v)
+
+	cleanup, upsert := rec.indexOf("CleanupLegacyAdmin"), rec.indexOf("UpsertCredentials")
+	if cleanup == -1 || upsert == -1 || cleanup < upsert {
+		t.Fatalf("cleanup must follow the vault write: %v", rec.calls)
+	}
+}
+
 func TestRunLAPSReportsVaultWriteFailure(t *testing.T) {
 	rec := &recorder{}
 	mgr := &fakeManager{rec: rec}
@@ -218,36 +292,74 @@ func TestRunLAPSReportsVaultWriteFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("RunLAPS should fail when the vault write fails")
 	}
+	if rec.indexOf("CleanupLegacyAdmin") != -1 {
+		t.Errorf("laps-bridge must not be touched when the vault write failed: %v", rec.calls)
+	}
 }
 
-// A password staged by a run that died mid-rotation may already be the live one, so it is a better reset candidate than the MDM fallback when nothing else is recorded.
 func TestRunLAPSPrefersStagedPasswordWhenNoneRecorded(t *testing.T) {
 	rec := &recorder{}
-	var seenOldPass string
-	mgr := &fakeManager{rec: rec}
+	mgr := &fakeManager{rec: rec, verifyErr: errors.ErrUnsupported}
 	v := &fakeVault{rec: rec, creds: &vault.Credentials{PendingPassword: "staged-from-last-run"}}
 
 	cfg := testConfig()
 	cfg.LegacyAdminPass = "mdm-fallback"
 
-	wrapped := &oldPassSpy{fakeManager: mgr, seen: &seenOldPass}
-	if err := RunLAPS(context.Background(), cfg, wrapped, v); err != nil {
+	if err := RunLAPS(context.Background(), cfg, mgr, v); err != nil {
 		t.Fatalf("RunLAPS returned an error: %v", err)
 	}
 
-	if seenOldPass != "staged-from-last-run" {
-		t.Errorf("reset used %q as the old password, want the staged one", seenOldPass)
+	if !reflect.DeepEqual(mgr.seenCandidates, []string{"staged-from-last-run", "mdm-fallback"}) {
+		t.Errorf("candidates = %q, want the staged one first and the MDM fallback last", mgr.seenCandidates)
 	}
 }
 
-type oldPassSpy struct {
-	*fakeManager
-	seen *string
+func TestRotationCandidatesOrderAndDedup(t *testing.T) {
+	creds := &vault.Credentials{PendingPassword: "P2", PreviousPendingPassword: "P1", OldPassword: "OLD"}
+	if got := rotationCandidates(creds, "legacy"); !reflect.DeepEqual(got, []string{"P2", "P1", "OLD", "legacy"}) {
+		t.Fatalf("candidates = %q, want [P2 P1 OLD legacy]", got)
+	}
+	creds = &vault.Credentials{PendingPassword: "P2", OldPassword: "P2"}
+	if got := rotationCandidates(creds, ""); !reflect.DeepEqual(got, []string{"P2"}) {
+		t.Fatalf("candidates = %q, want [P2]", got)
+	}
+	if got := rotationCandidates(&vault.Credentials{}, ""); len(got) != 0 {
+		t.Fatalf("candidates = %q, want none", got)
+	}
 }
 
-func (o *oldPassSpy) EnsureUserAndChangePassword(ctx context.Context, user, oldPass, altOldPass, newPass string) error {
-	*o.seen = oldPass
-	return o.fakeManager.EnsureUserAndChangePassword(ctx, user, oldPass, altOldPass, newPass)
+func TestRunLAPSLegacyPasswordIsTheLastCandidate(t *testing.T) {
+	rec := &recorder{}
+	mgr := &fakeManager{rec: rec}
+	v := &fakeVault{rec: rec, creds: &vault.Credentials{OldPassword: "previous-owner"}}
+	cfg := testConfig()
+	cfg.LegacyAdminPass = "enrollment"
+
+	if err := RunLAPS(context.Background(), cfg, mgr, v); err != nil {
+		t.Fatalf("RunLAPS returned an error: %v", err)
+	}
+	if !reflect.DeepEqual(mgr.seenCandidates, []string{"previous-owner", "enrollment"}) {
+		t.Fatalf("candidates = %q, want the recorded password and then the enrollment password", mgr.seenCandidates)
+	}
+}
+
+func TestRunLAPSAbortsBeforeVaultAccessWithoutSerial(t *testing.T) {
+	rec := &recorder{}
+	mgr := &fakeManager{rec: rec, sysInfoErr: errors.New("ioreg reported no IOPlatformSerialNumber")}
+	v := &fakeVault{rec: rec}
+
+	err := RunLAPS(context.Background(), testConfig(), mgr, v)
+	if err == nil {
+		t.Fatal("RunLAPS must fail when the device has no serial")
+	}
+	if !strings.Contains(err.Error(), "serial") {
+		t.Fatalf("the error must name the missing serial, got: %v", err)
+	}
+	for _, step := range []string{"GetCredentials", "StagePendingPassword", "UpsertCredentials", "ClearPendingPassword", "EnsureUserAndChangePassword"} {
+		if rec.indexOf(step) != -1 {
+			t.Fatalf("%s ran although the device has no serial: %v", step, rec.calls)
+		}
+	}
 }
 
 func TestRunLAPSSucceedsWithWarningWhenRecoveryCovered(t *testing.T) {
@@ -258,7 +370,6 @@ func TestRunLAPSSucceedsWithWarningWhenRecoveryCovered(t *testing.T) {
 	if err := RunLAPS(context.Background(), testConfig(), mgr, v); err != nil {
 		t.Fatalf("a tokenless admin on an MDM-covered device must not fail the run: %v", err)
 	}
-	// The degraded state still has to be visible in the vault record.
 	if v.savedToken != osmgmt.TokenStatusDisabledCovered {
 		t.Errorf("token status recorded as %q, want %q", v.savedToken, osmgmt.TokenStatusDisabledCovered)
 	}
@@ -273,7 +384,6 @@ func TestRunLAPSClearsPendingOnPolicyRejectedRotation(t *testing.T) {
 	if err == nil {
 		t.Fatal("a policy-rejected rotation must still fail the run")
 	}
-	// The refused password never reached the device, so the staged copy must not survive to poison the next run's passForReset fallback.
 	if rec.indexOf("ClearPendingPassword") == -1 {
 		t.Fatalf("the refused pending password was not cleared: %v", rec.calls)
 	}
@@ -290,32 +400,273 @@ func TestRunLAPSKeepsPendingOnOtherRotationFailures(t *testing.T) {
 	if err := RunLAPS(context.Background(), testConfig(), mgr, v); err == nil {
 		t.Fatal("a failed rotation must fail the run")
 	}
-	// For any other failure the staged password may BE the one the device took mid-rotation — it must stay as the recovery candidate.
 	if rec.indexOf("ClearPendingPassword") != -1 {
 		t.Fatalf("the pending password was cleared on a non-policy failure: %v", rec.calls)
 	}
 }
 
 func TestRunLAPSStartsWithPendingWhenPresent(t *testing.T) {
-	// A surviving pending copy is the likeliest live password (the previous run died after rotating), so it goes FIRST and the recorded one becomes the fallback.
 	rec := &recorder{}
-	mgr := &fakeManager{rec: rec}
+	mgr := &fakeManager{rec: rec, verifyErr: errors.ErrUnsupported}
 	v := &fakeVault{rec: rec, creds: &vault.Credentials{OldPassword: "recorded", PendingPassword: "staged"}}
 	if err := RunLAPS(context.Background(), testConfig(), mgr, v); err != nil {
 		t.Fatalf("RunLAPS failed: %v", err)
 	}
-	if mgr.seenOld != "staged" || mgr.seenAlt != "recorded" {
-		t.Fatalf("candidate order = (%q, %q), want (staged, recorded)", mgr.seenOld, mgr.seenAlt)
+	if !reflect.DeepEqual(mgr.seenCandidates, []string{"staged", "recorded"}) {
+		t.Fatalf("candidates = %q, want [staged recorded]", mgr.seenCandidates)
 	}
 
-	// No pending copy: the recorded password stays the primary and there is no alternate.
 	rec2 := &recorder{}
 	mgr2 := &fakeManager{rec: rec2}
 	v2 := &fakeVault{rec: rec2, creds: &vault.Credentials{OldPassword: "recorded"}}
 	if err := RunLAPS(context.Background(), testConfig(), mgr2, v2); err != nil {
 		t.Fatalf("RunLAPS failed: %v", err)
 	}
-	if mgr2.seenOld != "recorded" || mgr2.seenAlt != "" {
-		t.Fatalf("candidate order = (%q, %q), want (recorded, none)", mgr2.seenOld, mgr2.seenAlt)
+	if !reflect.DeepEqual(mgr2.seenCandidates, []string{"recorded"}) {
+		t.Fatalf("candidates = %q, want [recorded]", mgr2.seenCandidates)
+	}
+}
+
+func TestRunLAPSWiresBridgePasswordAndEscrow(t *testing.T) {
+	rec := &recorder{}
+	mgr := &fakeManager{rec: rec, cleanupAbsent: true}
+	v := &fakeVault{rec: rec, creds: &vault.Credentials{ItemID: "item1", OldPassword: "old", BridgePassword: "bridge-pw"}}
+
+	if err := RunLAPS(context.Background(), testConfig(), mgr, v); err != nil {
+		t.Fatalf("RunLAPS returned an error: %v", err)
+	}
+	if mgr.seenCreds[osmgmt.LegacyBridgeAdmin] != "bridge-pw" {
+		t.Fatalf("the escrowed bridge password must reach the candidate loop as the laps-bridge credential: %v", mgr.seenCreds)
+	}
+	if mgr.escrow == nil {
+		t.Fatal("the escrow route was not wired")
+	}
+	if err := mgr.escrow(context.Background(), "new-bridge-pw"); err != nil || v.bridgePass != "new-bridge-pw" {
+		t.Fatalf("the escrow route must write through the vault client (err=%v, stored=%q)", err, v.bridgePass)
+	}
+	wire, rotate := rec.indexOf("SetBridgeEscrow"), rec.indexOf("EnsureUserAndChangePassword")
+	if wire == -1 || wire > rotate {
+		t.Fatalf("the escrow route must exist before the rotation: %v", rec.calls)
+	}
+	cleanup, clear := rec.indexOf("CleanupLegacyAdmin"), rec.indexOf("ClearBridgePassword")
+	if clear == -1 || clear < cleanup {
+		t.Fatalf("the bridge field must be cleared after the cleanup removed laps-bridge: %v", rec.calls)
+	}
+}
+
+func TestRunLAPSKeepsBridgePasswordWhileBridgeExists(t *testing.T) {
+	rec := &recorder{}
+	mgr := &fakeManager{rec: rec, cleanupAbsent: false}
+	v := &fakeVault{rec: rec, creds: &vault.Credentials{ItemID: "item1", OldPassword: "old", BridgePassword: "bridge-pw"}}
+
+	if err := RunLAPS(context.Background(), testConfig(), mgr, v); err != nil {
+		t.Fatalf("RunLAPS returned an error: %v", err)
+	}
+	if rec.indexOf("ClearBridgePassword") != -1 {
+		t.Fatalf("the bridge password must stay while the bridge exists: %v", rec.calls)
+	}
+}
+
+func TestRunLAPSBridgeFieldWinsOverLegacyBridgePassword(t *testing.T) {
+	rec := &recorder{}
+	mgr := &fakeManager{rec: rec}
+	v := &fakeVault{rec: rec, creds: &vault.Credentials{ItemID: "item1", OldPassword: "old", LegacyLogin: "laps-bridge", LegacyPassword: "legacy", BridgePassword: "bridge-pw"}}
+
+	if err := RunLAPS(context.Background(), testConfig(), mgr, v); err != nil {
+		t.Fatalf("RunLAPS returned an error: %v", err)
+	}
+	if mgr.seenCreds["laps-bridge"] != "bridge-pw" {
+		t.Fatalf("the escrowed bridge password must win over the stale legacy field: %v", mgr.seenCreds)
+	}
+}
+
+func TestRunLAPSLegacyBridgePasswordWithoutBridgeField(t *testing.T) {
+	rec := &recorder{}
+	mgr := &fakeManager{rec: rec}
+	v := &fakeVault{rec: rec, creds: &vault.Credentials{ItemID: "item1", OldPassword: "old", LegacyLogin: "laps-bridge", LegacyPassword: "legacy"}}
+
+	if err := RunLAPS(context.Background(), testConfig(), mgr, v); err != nil {
+		t.Fatalf("RunLAPS returned an error: %v", err)
+	}
+	if mgr.seenCreds["laps-bridge"] != "legacy" {
+		t.Fatalf("the legacy password must be the laps-bridge credential when no bridge field exists: %v", mgr.seenCreds)
+	}
+}
+
+func TestRunLAPSDisabledNotCoveredStaysRed(t *testing.T) {
+	cases := []struct {
+		name   string
+		status string
+	}{
+		{"laps-bridge deadlock", osmgmt.TokenStatusDisabledDeadlock},
+		{"wrong password streak", osmgmt.TokenStatusDisabledWrongPassword},
+		{"window ended early", osmgmt.TokenStatusDisabledWindowKilled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recorder{}
+			mgr := &fakeManager{rec: rec, tokenStatus: tc.status}
+			v := &fakeVault{rec: rec}
+
+			err := RunLAPS(context.Background(), testConfig(), mgr, v)
+			if err == nil {
+				t.Fatalf("%s must fail the run", tc.name)
+			}
+			if v.savedToken != tc.status {
+				t.Fatalf("the vault must still record the state: %q", v.savedToken)
+			}
+		})
+	}
+}
+
+func TestVaultIntegrationVersionIsTheLAPSVersion(t *testing.T) {
+	if got := vault.IntegrationVersion(); got != "v"+version.Version {
+		t.Fatalf("vault integration version = %q, want v%s", got, version.Version)
+	}
+}
+
+func TestRunLAPSConfirmsLivePendingBeforeStaging(t *testing.T) {
+	rec := &recorder{}
+	mgr := &fakeManager{rec: rec, verifyLive: map[string]bool{"P1": true}}
+	v := &fakeVault{rec: rec, creds: &vault.Credentials{ItemID: "item1", OldPassword: "recorded", PendingPassword: "P2", PreviousPendingPassword: "P1"}}
+	cfg := testConfig()
+	cfg.LegacyAdminPass = "enrollment"
+
+	if err := RunLAPS(context.Background(), cfg, mgr, v); err != nil {
+		t.Fatalf("RunLAPS returned an error: %v", err)
+	}
+	if !reflect.DeepEqual(mgr.seenVerified, []string{"P2", "P1"}) {
+		t.Fatalf("verified %q, want the walk to stop at the first live candidate [P2 P1]", mgr.seenVerified)
+	}
+	if v.confirmedLive != "P1" {
+		t.Fatalf("ConfirmLivePassword received %q, want the live value P1", v.confirmedLive)
+	}
+	confirm, stage := rec.indexOf("ConfirmLivePassword"), rec.indexOf("StagePendingPassword")
+	if confirm == -1 || stage == -1 || confirm > stage {
+		t.Fatalf("the live value must be confirmed before the new one is staged: %v", rec.calls)
+	}
+	if verify := rec.indexOf("VerifyPassword"); verify == -1 || verify > stage {
+		t.Fatalf("the verification must run before the staging: %v", rec.calls)
+	}
+	if !reflect.DeepEqual(mgr.seenCandidates, []string{"P1"}) {
+		t.Fatalf("candidates = %q, want only the verified live value", mgr.seenCandidates)
+	}
+	if v.creds.OldPassword != "P1" || v.creds.PendingPassword != "" || v.creds.PreviousPendingPassword != "" {
+		t.Fatalf("creds after the confirm = %+v, want the live value recorded and both pending values cleared", *v.creds)
+	}
+}
+
+func TestRunLAPSRecordedLiveNeedsNoConfirmWrite(t *testing.T) {
+	rec := &recorder{}
+	mgr := &fakeManager{rec: rec, verifyLive: map[string]bool{"recorded": true}}
+	v := &fakeVault{rec: rec, creds: &vault.Credentials{ItemID: "item1", OldPassword: "recorded", PendingPassword: "P1"}}
+	cfg := testConfig()
+	cfg.LegacyAdminPass = "enrollment"
+
+	if err := RunLAPS(context.Background(), cfg, mgr, v); err != nil {
+		t.Fatalf("RunLAPS returned an error: %v", err)
+	}
+	if rec.indexOf("ConfirmLivePassword") != -1 {
+		t.Fatalf("the recorded password is live, so no confirm write is needed: %v", rec.calls)
+	}
+	if !reflect.DeepEqual(mgr.seenVerified, []string{"P1", "recorded"}) {
+		t.Fatalf("verified %q, want [P1 recorded]", mgr.seenVerified)
+	}
+	if !reflect.DeepEqual(mgr.seenCandidates, []string{"recorded"}) {
+		t.Fatalf("candidates = %q, want [recorded]", mgr.seenCandidates)
+	}
+}
+
+func TestRunLAPSNoLiveVaultCopyLeavesTheRestToTheRotation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		legacy string
+		want   []string
+	}{
+		{name: "legacy configured", legacy: "enrollment", want: []string{"enrollment"}},
+		{name: "no legacy", legacy: "", want: []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recorder{}
+			mgr := &fakeManager{rec: rec, verifyLive: map[string]bool{}}
+			v := &fakeVault{rec: rec, creds: &vault.Credentials{ItemID: "item1", OldPassword: "recorded", PendingPassword: "P2", PreviousPendingPassword: "P1"}}
+			cfg := testConfig()
+			cfg.LegacyAdminPass = tc.legacy
+
+			if err := RunLAPS(context.Background(), cfg, mgr, v); err != nil {
+				t.Fatalf("RunLAPS returned an error: %v", err)
+			}
+			if !reflect.DeepEqual(mgr.seenVerified, []string{"P2", "P1", "recorded"}) {
+				t.Fatalf("verified %q, want the three vault copies once and never the legacy password", mgr.seenVerified)
+			}
+			if rec.indexOf("EnsureUserAndChangePassword") == -1 {
+				t.Fatalf("the rotation step must still run: %v", rec.calls)
+			}
+			if !reflect.DeepEqual(mgr.seenCandidates, tc.want) {
+				t.Fatalf("candidates = %q, want %q", mgr.seenCandidates, tc.want)
+			}
+			if rec.indexOf("ConfirmLivePassword") != -1 {
+				t.Fatalf("nothing is live, so nothing must be confirmed: %v", rec.calls)
+			}
+		})
+	}
+}
+
+func TestRunLAPSVerificationErrorKeepsFullCandidateList(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "unsupported", err: errors.ErrUnsupported},
+		{name: "helper could not run", err: errors.New("fork/exec: no such file")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recorder{}
+			mgr := &fakeManager{rec: rec, verifyErr: tc.err}
+			v := &fakeVault{rec: rec, creds: &vault.Credentials{ItemID: "item1", OldPassword: "recorded", PendingPassword: "P1"}}
+			cfg := testConfig()
+			cfg.LegacyAdminPass = "enrollment"
+
+			if err := RunLAPS(context.Background(), cfg, mgr, v); err != nil {
+				t.Fatalf("RunLAPS returned an error: %v", err)
+			}
+			if !reflect.DeepEqual(mgr.seenCandidates, []string{"P1", "recorded", "enrollment"}) {
+				t.Fatalf("candidates = %q, want the full list [P1 recorded enrollment]", mgr.seenCandidates)
+			}
+			if rec.indexOf("ConfirmLivePassword") != -1 {
+				t.Fatalf("no confirm write without a verification: %v", rec.calls)
+			}
+		})
+	}
+}
+
+func TestRunLAPSSkipsVerificationWithoutPending(t *testing.T) {
+	rec := &recorder{}
+	mgr := &fakeManager{rec: rec, verifyLive: map[string]bool{"recorded": true}}
+	v := &fakeVault{rec: rec, creds: &vault.Credentials{ItemID: "item1", OldPassword: "recorded"}}
+
+	if err := RunLAPS(context.Background(), testConfig(), mgr, v); err != nil {
+		t.Fatalf("RunLAPS returned an error: %v", err)
+	}
+	if rec.indexOf("VerifyPassword") != -1 {
+		t.Fatalf("no pending value, so no verification: %v", rec.calls)
+	}
+	if !reflect.DeepEqual(mgr.seenCandidates, []string{"recorded"}) {
+		t.Fatalf("candidates = %q, want [recorded]", mgr.seenCandidates)
+	}
+}
+
+func TestRunLAPSAbortsWhenConfirmWriteFails(t *testing.T) {
+	rec := &recorder{}
+	mgr := &fakeManager{rec: rec, verifyLive: map[string]bool{"P1": true}}
+	v := &fakeVault{rec: rec, confirmErr: errors.New("put failed"), creds: &vault.Credentials{ItemID: "item1", OldPassword: "recorded", PendingPassword: "P1"}}
+
+	if err := RunLAPS(context.Background(), testConfig(), mgr, v); err == nil {
+		t.Fatal("RunLAPS must fail when the live password cannot be recorded")
+	}
+	for _, step := range []string{"StagePendingPassword", "EnsureUserAndChangePassword"} {
+		if rec.indexOf(step) != -1 {
+			t.Fatalf("%s ran although the vault refused the confirm write: %v", step, rec.calls)
+		}
 	}
 }
