@@ -39,15 +39,23 @@
     SELECT 1 FROM file
     WHERE path = 'C:\Program Files\GoLAPS\golaps.exe' AND type = 'regular';
 
-- name: GoLAPS - Windows managed admin account exists
+- name: GoLAPS - Windows managed admin exists in Administrators and rotated recently
   platform: windows
-  description: Verify that the GoLAPS managed local administrator account exists on Windows.
+  description: >-
+    Verify that the managed administrator exists, belongs to Administrators (S-1-5-32-544),
+    and rotated within the last 30 days.
   resolution: >-
     Fleet runs run-golaps-windows.ps1 automatically on Fleet Premium, or run it manually
     from the host Scripts tab.
   critical: true
   query: >-
-    SELECT 1 FROM users
-    WHERE username = 'example-admin';
+    SELECT 1
+    FROM users u
+    JOIN user_groups ug ON ug.uid = u.uid
+    JOIN groups g ON g.gid = ug.gid
+    JOIN file f ON f.path = 'C:\ProgramData\GoLAPS\last_rotation.txt'
+    WHERE u.username = 'example-admin'
+      AND g.group_sid = 'S-1-5-32-544'
+      AND f.mtime > (strftime('%s', 'now') - 2592000);
   run_script:
     path: ../scripts/run-golaps-windows.ps1

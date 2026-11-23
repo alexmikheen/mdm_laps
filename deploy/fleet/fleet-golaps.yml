@@ -18,10 +18,12 @@ software:
     - url: https://releases.example.com/golaps/golaps_v1.0.0.pkg
       hash_sha256: 0000000000000000000000000000000000000000000000000000000000000000
       self_service: false
-    # Windows executable built by scripts/build/build.sh.
+    # Windows executable built by scripts/build/build.sh, installed via install_script.
     - url: https://releases.example.com/golaps/golaps_windows_amd64.exe
       hash_sha256: 0000000000000000000000000000000000000000000000000000000000000000
       self_service: false
+      install_script:
+        path: ./scripts/install-golaps-windows.ps1
 
 policies:
   # Load GoLAPS compliance and automatic remediation policies.

@@ -16,6 +16,7 @@ The [deploy/fleet](../deploy/fleet) directory contains a Fleet 5 GitOps bundle:
 - [fleet-golaps.yml](../deploy/fleet/fleet-golaps.yml) — Fleet configuration for packages, profiles, scripts, and policies.
 - [run-golaps-macos.sh](../deploy/fleet/scripts/run-golaps-macos.sh) — macOS trigger script.
 - [run-golaps-windows.ps1](../deploy/fleet/scripts/run-golaps-windows.ps1) — Windows trigger script.
+- [install-golaps-windows.ps1](../deploy/fleet/scripts/install-golaps-windows.ps1) — Windows Fleet package install script.
 - [golaps-policies.yml](../deploy/fleet/policies/golaps-policies.yml) — osquery compliance and remediation policies.
 - [admin_config.mobileconfig](../profiles/macos/admin_config.mobileconfig) — macOS managed preferences profile for the `io.github.golaps` domain.
 
@@ -57,7 +58,7 @@ Fleet 5 places macOS configuration profiles under `controls.apple_settings.confi
 1. **GoLAPS - macOS binary installed**: Checks that `/usr/local/bin/golaps` exists as a regular file in the `file` table.
 2. **GoLAPS - macOS managed admin holds Secure Token and rotated recently**: Joins `/var/db/dslocal/nodes/Default/users/example-admin.plist` (`authentication_authority` contains `SecureToken`) with `/Library/Logs/golaps.log` modified within the last 30 days (`2592000` seconds). On failure, Fleet runs `../scripts/run-golaps-macos.sh`.
 3. **GoLAPS - Windows binary installed**: Checks that `C:\Program Files\GoLAPS\golaps.exe` exists as a regular file in the `file` table.
-4. **GoLAPS - Windows managed admin account exists**: Checks that the managed administrator exists in the `users` table. On failure, Fleet runs `../scripts/run-golaps-windows.ps1`.
+4. **GoLAPS - Windows managed admin exists in Administrators and rotated recently**: Checks that the managed administrator belongs to `Administrators` (`S-1-5-32-544`) and that `C:\ProgramData\GoLAPS\last_rotation.txt` updated within the last 30 days. On failure, Fleet runs `../scripts/run-golaps-windows.ps1`.
 
 Each `run_script.path` value is relative to the policy YAML file and must match an entry in `controls.scripts` of the same fleet.
 
