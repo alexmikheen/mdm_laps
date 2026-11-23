@@ -36,7 +36,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "C:\Program Files\GoLAPS" | Out-Null
-          go build -trimpath -ldflags="-s -w" -o "C:\Program Files\GoLAPS\golaps.exe" ./cmd/main.go
+          go build -trimpath -ldflags="-s -w" -o "C:\Program Files\GoLAPS\golaps.exe" ./cmd
 
       - name: Start local HashiCorp Vault dev server
         shell: pwsh
