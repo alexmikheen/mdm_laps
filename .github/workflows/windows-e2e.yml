@@ -1,0 +1,182 @@
+name: Windows E2E Test
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'deploy/fleet/scripts/run-golaps-windows.ps1'
+      - '.github/workflows/windows-e2e.yml'
+  pull_request:
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'deploy/fleet/scripts/run-golaps-windows.ps1'
+
+jobs:
+  windows-e2e:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run go vet and unit tests on Windows
+        shell: pwsh
+        run: |
+          go vet ./...
+          go test -v ./cmd ./internal/config ./internal/core ./internal/password ./internal/osmgmt ./internal/vault
+
+      - name: Build and install golaps.exe via Fleet install script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stageExe = "$env:TEMP\golaps_stage.exe"
+          go build -trimpath -ldflags="-s -w" -o $stageExe ./cmd
+          $env:INSTALLER_PATH = $stageExe
+          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "deploy/fleet/scripts/install-golaps-windows.ps1"
+          if ($LASTEXITCODE -ne 0) { throw "install-golaps-windows.ps1 failed with exit code $LASTEXITCODE" }
+          Remove-Item -LiteralPath $stageExe -Force -ErrorAction SilentlyContinue
+
+      - name: Run Fleet Windows trigger script against local Vault (create + rotate + verify)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $vaultVersion = "1.18.4"
+          $zipName = "vault_${vaultVersion}_windows_amd64.zip"
+          $zipPath = "$env:TEMP\$zipName"
+          $sumsPath = "$env:TEMP\vault_SHA256SUMS"
+          Invoke-WebRequest -Uri "https://releases.hashicorp.com/vault/${vaultVersion}/${zipName}" -OutFile $zipPath
+          Invoke-WebRequest -Uri "https://releases.hashicorp.com/vault/${vaultVersion}/vault_${vaultVersion}_SHA256SUMS" -OutFile $sumsPath
+          $expectedHash = ((Get-Content $sumsPath | Where-Object { $_ -match "\s+$zipName$" }) -split '\s+')[0].ToLowerInvariant()
+          $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ([string]::IsNullOrWhiteSpace($expectedHash) -or $actualHash -ne $expectedHash) {
+            throw "Vault SHA-256 mismatch: expected $expectedHash, got $actualHash"
+          }
+          Expand-Archive -Path $zipPath -DestinationPath "$env:TEMP\vault-bin" -Force
+          $vaultProc = Start-Process -FilePath "$env:TEMP\vault-bin\vault.exe" `
+            -ArgumentList "server", "-dev", "-dev-root-token-id=golaps-e2e-token", "-dev-listen-address=127.0.0.1:18200" `
+            -PassThru -NoNewWindow
+
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:18200/v1/sys/health" -UseBasicParsing -TimeoutSec 2
+                if ($r.StatusCode -eq 200) { $ready = $true; Write-Host "Vault is ready"; break }
+              } catch {
+                Start-Sleep -Seconds 1
+              }
+            }
+            if (-not $ready) { throw "Vault did not become ready in time" }
+
+            # Simulate Fleet server-side secret substitution on run-golaps-windows.ps1.
+            $scriptSrc = Get-Content -Raw "deploy/fleet/scripts/run-golaps-windows.ps1"
+            $rendered = $scriptSrc.Replace('$FLEET_SECRET_GOLAPS_VAULT_TOKEN', 'golaps-e2e-token')
+            $renderedPath = "$env:TEMP\run-golaps-windows-rendered.ps1"
+            Set-Content -Path $renderedPath -Value $rendered -NoNewline
+
+            $env:LAPS_ADMIN_USER = "GoLAPSAdmin"
+            $env:LAPS_VAULT_TYPE = "hashicorp"
+            $env:LAPS_VAULT_ID = "laps"
+            $env:VAULT_ADDR = "http://127.0.0.1:18200"
+            $env:LAPS_VAULT_PATH = "secret/data/laps"
+
+            Write-Host "=== Run 1: Provision GoLAPSAdmin ==="
+            powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $renderedPath
+            if ($LASTEXITCODE -ne 0) { throw "Run 1 failed with exit code $LASTEXITCODE" }
+
+            # Verify Windows local account and Administrators SID S-1-5-32-544 membership.
+            $u = Get-LocalUser -Name "GoLAPSAdmin"
+            if (-not $u.Enabled) { throw "GoLAPSAdmin is not enabled" }
+            $admins = Get-LocalGroupMember -SID 'S-1-5-32-544'
+            if (-not ($admins | Where-Object { $_.SID.Value -eq $u.SID.Value })) {
+              throw "GoLAPSAdmin is not in Administrators (S-1-5-32-544)"
+            }
+
+            # Read serial and verify Vault record.
+            $headers = @{ "X-Vault-Token" = "golaps-e2e-token" }
+            $list = Invoke-RestMethod -Uri "http://127.0.0.1:18200/v1/secret/metadata/laps?list=true" -Headers $headers
+            $serial = $list.data.keys[0]
+            Write-Host "Escrowed device serial: $serial"
+
+            $sec1 = (Invoke-RestMethod -Uri "http://127.0.0.1:18200/v1/secret/data/laps/$serial" -Headers $headers).data.data
+            if ($sec1.login -ne "GoLAPSAdmin") { throw "Unexpected login in Vault: $($sec1.login)" }
+            if ([string]::IsNullOrWhiteSpace($sec1.password) -or $sec1.password.Length -lt 16) { throw "Invalid password in Vault" }
+            if ($sec1.PSObject.Properties.Name -contains "pending_password") { throw "pending_password was not cleared" }
+            $pass1 = $sec1.password
+
+            Write-Host "=== Run 2: Rotate GoLAPSAdmin password ==="
+            powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $renderedPath
+            if ($LASTEXITCODE -ne 0) { throw "Run 2 failed with exit code $LASTEXITCODE" }
+
+            $sec2 = (Invoke-RestMethod -Uri "http://127.0.0.1:18200/v1/secret/data/laps/$serial" -Headers $headers).data.data
+            if ($sec2.password -eq $pass1) { throw "Password did not change on Run 2" }
+            if ($sec2.PSObject.Properties.Name -contains "pending_password") { throw "pending_password was not cleared on Run 2" }
+
+            # Verify Windows actually accepts the rotated password and rejects the previous one.
+            Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+            $ctx = [System.DirectoryServices.AccountManagement.PrincipalContext]::new([System.DirectoryServices.AccountManagement.ContextType]::Machine)
+            if (-not $ctx.ValidateCredentials("GoLAPSAdmin", $sec2.password)) {
+              throw "Windows rejected the rotated Vault password for GoLAPSAdmin"
+            }
+            if ($ctx.ValidateCredentials("GoLAPSAdmin", $pass1)) {
+              throw "Windows still accepted the previous password after rotation"
+            }
+
+            # Verify rotation marker exists, parses as ISO-8601, and denies write access to BUILTIN\Users.
+            $markerPath = "C:\ProgramData\GoLAPS\last_rotation.txt"
+            if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) { throw "Rotation marker missing" }
+            $ts = (Get-Content -Raw -LiteralPath $markerPath).Trim()
+            [void][DateTimeOffset]::Parse($ts)
+            $markerAcl = Get-Acl -LiteralPath $markerPath
+            foreach ($r in $markerAcl.Access) {
+              if ($r.AccessControlType -eq 'Allow' -and ($r.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::WriteData)) {
+                $sid = $r.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                if ($sid -eq 'S-1-5-32-545') { throw "BUILTIN\Users has write access to rotation marker" }
+              }
+            }
+
+            # Negative security test: grant BUILTIN\Users write access and verify Assert-TrustedPath refuses to run.
+            icacls "C:\Program Files\GoLAPS\golaps.exe" /grant "*S-1-5-32-545:(W)" | Out-Null
+            powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $renderedPath
+            if ($LASTEXITCODE -eq 0) { throw "Expected run-golaps-windows.ps1 to fail closed on writable binary" }
+            Write-Host "Negative ACL check passed (script refused writable binary with exit $LASTEXITCODE)."
+
+            Write-Host "Run 1, Run 2, credential validation, marker ACL, and negative ACL tests passed."
+            $global:LASTEXITCODE = 0
+          } finally {
+            if ($renderedPath -and (Test-Path -LiteralPath $renderedPath)) {
+              Remove-Item -LiteralPath $renderedPath -Force -ErrorAction SilentlyContinue
+            }
+            if ($vaultProc -and -not $vaultProc.HasExited) {
+              Stop-Process -Id $vaultProc.Id -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+      - name: Verify Global\GoLAPS_RunLock kernel mutex blocks concurrent run
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $createdNew = $false
+          $mutex = [System.Threading.Mutex]::new($true, 'Global\GoLAPS_RunLock', [ref]$createdNew)
+          try {
+            if (-not $createdNew) { throw "Expected to acquire Global\GoLAPS_RunLock" }
+            $out = "golaps-e2e-token`n`n" | & "C:\Program Files\GoLAPS\golaps.exe" --secrets-from-stdin 2>&1 | Out-String
+            Write-Host $out
+            if ($LASTEXITCODE -ne 0) { throw "Expected exit 0 when lock is held, got $LASTEXITCODE" }
+            if ($out -notmatch 'Another GoLAPS run holds') { throw "Expected lock-held log message" }
+          } finally {
+            $mutex.ReleaseMutex()
+            $mutex.Dispose()
+          }
+          Write-Host "Global\GoLAPS_RunLock mutex test passed."

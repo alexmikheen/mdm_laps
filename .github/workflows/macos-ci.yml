@@ -1,0 +1,85 @@
+name: macOS CI & Package Check
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'scripts/**'
+      - 'deploy/fleet/**'
+      - 'profiles/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/macos-ci.yml'
+  pull_request:
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'scripts/**'
+      - 'deploy/fleet/**'
+      - 'profiles/**'
+      - 'go.mod'
+      - 'go.sum'
+
+jobs:
+  macos-ci:
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+
+      - name: Run go vet and full race-enabled tests
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Lint shell scripts and mobileconfig
+        run: |
+          bash -n scripts/build/build.sh scripts/mdm/macos/*.sh deploy/fleet/scripts/run-golaps-macos.sh
+          plutil -lint profiles/macos/admin_config.mobileconfig
+
+      - name: Build macOS .pkg and verify clean BOM, signing, and installation
+        run: |
+          GOLAPS_VERSION=1.0.0 bash scripts/build/build.sh
+          PKG="release/golaps_v1.0.0.pkg"
+
+          echo "=== Package BOM ==="
+          pkgutil --payload-files "$PKG"
+          if pkgutil --payload-files "$PKG" | grep -q '/\._'; then
+            echo "::error::Package BOM contains AppleDouble (._*) files"
+            exit 1
+          fi
+
+          sudo installer -pkg "$PKG" -target /
+          for bin in /usr/local/bin/golaps /usr/local/bin/mac_helper /usr/local/bin/golaps_auth; do
+            SIG=$(codesign -dvvv "$bin" 2>&1)
+            echo "$SIG" | grep -E "Identifier=|flags="
+            echo "$SIG" | grep -q "runtime" || { echo "::error::$bin missing Hardened Runtime flag"; exit 1; }
+          done
+
+          if strings /usr/local/bin/golaps | grep -q "/Users/runner"; then
+            echo "::error::golaps leaked build runner paths (-trimpath failed)"
+            exit 1
+          fi
+          if strings /usr/local/bin/golaps_auth | grep -q "LAPS_TEST_AUTH_SOCKET"; then
+            echo "::error::golaps_auth contains test-only LAPS_TEST_AUTH_SOCKET symbol"
+            exit 1
+          fi
+
+          CAPS=$(/usr/local/bin/golaps --capabilities)
+          echo "Capabilities: $CAPS"
+          [[ "$CAPS" == *"recreate-locked"* ]] || { echo "::error::Missing recreate-locked capability"; exit 1; }

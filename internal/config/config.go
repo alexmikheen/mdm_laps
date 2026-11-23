@@ -222,7 +222,7 @@ func hasFlag(args []string, flag string) bool {
 
 func readLine(r *bufio.Reader) string {
 	line, _ := r.ReadString('\n')
-	return strings.TrimSpace(line)
+	return strings.TrimSpace(strings.TrimPrefix(line, "\uFEFF"))
 }
 
 func getEnv(getenv func(string) string, key, fallback string) string {

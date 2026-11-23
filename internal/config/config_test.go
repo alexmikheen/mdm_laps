@@ -60,7 +60,7 @@ func TestLoadSecretsFromStdin(t *testing.T) {
 		"LAPS_VAULT_TYPE": "onepassword",
 	})
 	src.args = []string{"golaps", "--secrets-from-stdin"}
-	src.stdin = strings.NewReader("  stdin_token \n  stdin_legacy \n")
+	src.stdin = strings.NewReader("\uFEFF  stdin_token \r\n  stdin_legacy \r\n")
 
 	cfg, err := load(context.Background(), src)
 	if err != nil {

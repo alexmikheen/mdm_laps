@@ -79,6 +79,15 @@ func TestEnsureAccountScriptReadsThePasswordFromStdin(t *testing.T) {
 	if !strings.HasSuffix(trimmed, "Write-Output '"+resultMarker+"'") {
 		t.Fatal("the result marker is not the last statement of the script")
 	}
+	if strings.Contains(ensureAccountScript, "-Member $account.SID") {
+		t.Fatal("Add-LocalGroupMember -Member rejects SecurityIdentifier objects; pass $account instead")
+	}
+	if !strings.Contains(ensureAccountScript, "Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $account") {
+		t.Fatal("the script must pass the LocalUser object $account to Add-LocalGroupMember")
+	}
+	if !strings.Contains(ensureAccountScript, "$ProgressPreference = 'SilentlyContinue'") || !strings.Contains(serialScript, "$ProgressPreference = 'SilentlyContinue'") {
+		t.Fatal("PowerShell scripts must suppress CLIXML progress output on stderr")
+	}
 }
 
 func TestScriptReportsSuccessNeedsTheExactMarkerLine(t *testing.T) {
@@ -107,12 +116,12 @@ func TestScriptReportsSuccessNeedsTheExactMarkerLine(t *testing.T) {
 }
 
 func TestValidateWindowsSerialRejectsPlaceholders(t *testing.T) {
-	for _, bad := range []string{"", "   ", "Unknown", "unknown", "To be filled by O.E.M.", "TO BE FILLED BY O.E.M.", "Default string", "0", "System Serial Number", "Not Specified", "not specified"} {
+	for _, bad := range []string{"", "   ", "Unknown", "unknown", "To be filled by O.E.M.", "TO BE FILLED BY O.E.M.", "Default string", "0", "00000000-0000-0000-0000-000000000000", "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF", "System Serial Number", "Not Specified", "not specified"} {
 		if got, err := validateWindowsSerial(bad); err == nil {
 			t.Fatalf("validateWindowsSerial(%q) = %q, want an error", bad, got)
 		}
 	}
-	for _, good := range []string{"PF2ABCDE", " 5CD1234XYZ ", "VMware-56 4d 12 ab"} {
+	for _, good := range []string{"PF2ABCDE", " 5CD1234XYZ ", "VMware-56 4d 12 ab", "7967FCD2-0CE4-4C0E-AE6C-F66536181D11"} {
 		got, err := validateWindowsSerial(good)
 		if err != nil {
 			t.Fatalf("validateWindowsSerial(%q): %v", good, err)

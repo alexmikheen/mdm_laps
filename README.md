@@ -10,7 +10,7 @@
 
 GoLAPS rotates managed local administrator passwords on **macOS (Apple Silicon)** and **Windows (x64)** fleets. It stores the new credential in your vault provider before it changes the device account.
 
-You can deploy GoLAPS with any MDM platform, such as Kandji, Jamf Pro, Microsoft Intune, Mosyle, or SimpleMDM.
+You can deploy GoLAPS with any MDM platform, such as [Fleet](docs/fleet-mdm.md), Kandji, Jamf Pro, Microsoft Intune, Mosyle, or SimpleMDM.
 
 ---
 
@@ -33,8 +33,7 @@ See [docs/configuration.md](docs/configuration.md) for full provider configurati
 On Apple Silicon Macs, the managed administrator account can lack a Secure Token. If a silent grant fails, GoLAPS opens a native **SwiftUI + AppKit** window (`/usr/local/bin/golaps_auth`) instead of `osascript`:
 
 <p align="center">
-  <img src="docs/auth-window.png" alt="GoLAPS Native macOS Auth Window" width="420">
-  <img src="docs/auth-window-done.png" alt="GoLAPS Native macOS Auth Window Complete" width="420">
+  <img src="docs/auth-window-demo.gif" alt="GoLAPS Native macOS Auth Window Demo" width="520">
 </p>
 
 - **Zero plaintext in stdout or argv**: the window sends the password over a root-owned Unix socket (`/var/run/golaps_auth.sock`). Both sides check peer UID with `getpeereid` and `LOCAL_PEERCRED`.
