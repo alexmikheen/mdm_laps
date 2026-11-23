@@ -11,15 +11,33 @@ import (
 	"errors"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 )
 
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func captureLog(fn func()) string {
-	var buf bytes.Buffer
+	var buf syncBuffer
 	prev := log.Writer()
 	log.SetOutput(&buf)
-	defer log.SetOutput(prev)
 	fn()
+	log.SetOutput(prev)
 	return buf.String()
 }
 

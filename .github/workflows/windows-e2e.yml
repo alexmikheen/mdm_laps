@@ -153,6 +153,7 @@ jobs:
             Write-Host "Negative ACL check passed (script refused writable binary with exit $LASTEXITCODE)."
 
             Write-Host "Run 1, Run 2, credential validation, marker ACL, and negative ACL tests passed."
+            $global:LASTEXITCODE = 0
           } finally {
             if ($renderedPath -and (Test-Path -LiteralPath $renderedPath)) {
               Remove-Item -LiteralPath $renderedPath -Force -ErrorAction SilentlyContinue
