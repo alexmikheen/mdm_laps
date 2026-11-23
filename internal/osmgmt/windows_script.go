@@ -73,13 +73,16 @@ $placeholders = @(
 function Test-ValidSerial($s) {
     if ([string]::IsNullOrWhiteSpace($s)) { return $false }
     $t = $s.Trim()
-    if ($t -match '^[0-]+$') { return $false }
+    if ($t -match '^[0-]+$' -or $t -match '^[fF-]+$') { return $false }
     if ($placeholders -contains $t.ToLowerInvariant()) { return $false }
     return $true
 }
 $serial = (Get-CimInstance -ClassName Win32_BIOS).SerialNumber
 if (-not (Test-ValidSerial $serial)) {
     $serial = (Get-CimInstance -ClassName Win32_ComputerSystemProduct).IdentifyingNumber
+}
+if (-not (Test-ValidSerial $serial)) {
+    $serial = (Get-CimInstance -ClassName Win32_ComputerSystemProduct).UUID
 }
 Write-Output $serial
 `
@@ -138,8 +141,8 @@ func validateWindowsSerial(raw string) (string, error) {
 			return "", fmt.Errorf("the firmware serial contains control characters: %q", serial)
 		}
 	}
-	if strings.Trim(serial, "0-") == "" {
-		return "", fmt.Errorf("the firmware reported an all-zero placeholder serial %q", serial)
+	if strings.Trim(serial, "0-") == "" || strings.Trim(strings.ToUpper(serial), "F-") == "" {
+		return "", fmt.Errorf("the firmware reported an all-zero or all-F placeholder serial %q", serial)
 	}
 	for _, placeholder := range windowsSerialPlaceholders {
 		if strings.EqualFold(serial, placeholder) {
