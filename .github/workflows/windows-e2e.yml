@@ -35,11 +35,16 @@ jobs:
           go vet ./...
           go test -v ./cmd ./internal/config ./internal/core ./internal/password ./internal/osmgmt ./internal/vault
 
-      - name: Build golaps.exe
+      - name: Build and install golaps.exe via Fleet install script
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path "C:\Program Files\GoLAPS" | Out-Null
-          go build -trimpath -ldflags="-s -w" -o "C:\Program Files\GoLAPS\golaps.exe" ./cmd
+          $ErrorActionPreference = 'Stop'
+          $stageExe = "$env:TEMP\golaps_stage.exe"
+          go build -trimpath -ldflags="-s -w" -o $stageExe ./cmd
+          $env:INSTALLER_PATH = $stageExe
+          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "deploy/fleet/scripts/install-golaps-windows.ps1"
+          if ($LASTEXITCODE -ne 0) { throw "install-golaps-windows.ps1 failed with exit code $LASTEXITCODE" }
+          Remove-Item -LiteralPath $stageExe -Force -ErrorAction SilentlyContinue
 
       - name: Run Fleet Windows trigger script against local Vault (create + rotate + verify)
         shell: pwsh
@@ -117,8 +122,41 @@ jobs:
             $sec2 = (Invoke-RestMethod -Uri "http://127.0.0.1:18200/v1/secret/data/laps/$serial" -Headers $headers).data.data
             if ($sec2.password -eq $pass1) { throw "Password did not change on Run 2" }
             if ($sec2.PSObject.Properties.Name -contains "pending_password") { throw "pending_password was not cleared on Run 2" }
-            Write-Host "Run 1 & Run 2 verified successfully (password rotated, Administrators SID verified)."
+
+            # Verify Windows actually accepts the rotated password and rejects the previous one.
+            Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+            $ctx = [System.DirectoryServices.AccountManagement.PrincipalContext]::new([System.DirectoryServices.AccountManagement.ContextType]::Machine)
+            if (-not $ctx.ValidateCredentials("GoLAPSAdmin", $sec2.password)) {
+              throw "Windows rejected the rotated Vault password for GoLAPSAdmin"
+            }
+            if ($ctx.ValidateCredentials("GoLAPSAdmin", $pass1)) {
+              throw "Windows still accepted the previous password after rotation"
+            }
+
+            # Verify rotation marker exists, parses as ISO-8601, and denies write access to BUILTIN\Users.
+            $markerPath = "C:\ProgramData\GoLAPS\last_rotation.txt"
+            if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) { throw "Rotation marker missing" }
+            $ts = (Get-Content -Raw -LiteralPath $markerPath).Trim()
+            [void][DateTimeOffset]::Parse($ts)
+            $markerAcl = Get-Acl -LiteralPath $markerPath
+            foreach ($r in $markerAcl.Access) {
+              if ($r.AccessControlType -eq 'Allow' -and ($r.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::WriteData)) {
+                $sid = $r.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                if ($sid -eq 'S-1-5-32-545') { throw "BUILTIN\Users has write access to rotation marker" }
+              }
+            }
+
+            # Negative security test: grant BUILTIN\Users write access and verify Assert-TrustedPath refuses to run.
+            icacls "C:\Program Files\GoLAPS\golaps.exe" /grant "*S-1-5-32-545:(W)" | Out-Null
+            powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $renderedPath
+            if ($LASTEXITCODE -eq 0) { throw "Expected run-golaps-windows.ps1 to fail closed on writable binary" }
+            Write-Host "Negative ACL check passed (script refused writable binary with exit $LASTEXITCODE)."
+
+            Write-Host "Run 1, Run 2, credential validation, marker ACL, and negative ACL tests passed."
           } finally {
+            if ($renderedPath -and (Test-Path -LiteralPath $renderedPath)) {
+              Remove-Item -LiteralPath $renderedPath -Force -ErrorAction SilentlyContinue
+            }
             if ($vaultProc -and -not $vaultProc.HasExited) {
               Stop-Process -Id $vaultProc.Id -Force -ErrorAction SilentlyContinue
             }
