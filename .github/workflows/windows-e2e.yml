@@ -175,6 +175,7 @@ jobs:
             Write-Host $out
             if ($LASTEXITCODE -ne 75) { throw "Expected exit 75 when lock is held, got $LASTEXITCODE" }
             if ($out -notmatch 'Another GoLAPS run holds') { throw "Expected lock-held log message" }
+            $global:LASTEXITCODE = 0
           } finally {
             $mutex.ReleaseMutex()
             $mutex.Dispose()

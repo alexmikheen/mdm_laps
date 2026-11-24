@@ -136,7 +136,13 @@ jobs:
           export LAPS_VAULT_PATH="secret/data/laps"
 
           echo "=== Run 1: Provision ${LAPS_ADMIN_USER} ==="
-          sudo -E bash "$RENDERED_SCRIPT"
+          sudo env \
+            LAPS_ADMIN_USER="$LAPS_ADMIN_USER" \
+            LAPS_VAULT_TYPE="$LAPS_VAULT_TYPE" \
+            LAPS_VAULT_ID="$LAPS_VAULT_ID" \
+            VAULT_ADDR="$VAULT_ADDR" \
+            LAPS_VAULT_PATH="$LAPS_VAULT_PATH" \
+            bash "$RENDERED_SCRIPT"
 
           # Verify Linux local user exists and belongs to sudo group.
           id "$LAPS_ADMIN_USER"
@@ -161,7 +167,13 @@ jobs:
           ')
 
           echo "=== Run 2: Rotate ${LAPS_ADMIN_USER} password ==="
-          sudo -E bash "$RENDERED_SCRIPT"
+          sudo env \
+            LAPS_ADMIN_USER="$LAPS_ADMIN_USER" \
+            LAPS_VAULT_TYPE="$LAPS_VAULT_TYPE" \
+            LAPS_VAULT_ID="$LAPS_VAULT_ID" \
+            VAULT_ADDR="$VAULT_ADDR" \
+            LAPS_VAULT_PATH="$LAPS_VAULT_PATH" \
+            bash "$RENDERED_SCRIPT"
 
           PASS2=$(curl -fsS -H "X-Vault-Token: golaps-e2e-token" \
             "http://127.0.0.1:18200/v1/secret/data/laps/${SERIAL}" \
@@ -223,7 +235,13 @@ jobs:
           # Negative security test: make /usr/local/bin/golaps group-writable and verify fail-closed refusal.
           sudo chmod 0775 /usr/local/bin/golaps
           set +e
-          sudo -E bash "$RENDERED_SCRIPT"
+          sudo env \
+            LAPS_ADMIN_USER="$LAPS_ADMIN_USER" \
+            LAPS_VAULT_TYPE="$LAPS_VAULT_TYPE" \
+            LAPS_VAULT_ID="$LAPS_VAULT_ID" \
+            VAULT_ADDR="$VAULT_ADDR" \
+            LAPS_VAULT_PATH="$LAPS_VAULT_PATH" \
+            bash "$RENDERED_SCRIPT"
           NEG_EXIT=$?
           set -e
           sudo chmod 0755 /usr/local/bin/golaps
@@ -235,7 +253,7 @@ jobs:
 
           # Negative placeholder check: verify unedited example-admin placeholder is refused fail-closed.
           set +e
-          sudo LAPS_ADMIN_USER="example-admin" LAPS_VAULT_TYPE="hashicorp" LAPS_VAULT_ID="laps" \
+          sudo env LAPS_ADMIN_USER="example-admin" LAPS_VAULT_TYPE="hashicorp" LAPS_VAULT_ID="laps" \
             VAULT_ADDR="http://127.0.0.1:18200" LAPS_VAULT_PATH="secret/data/laps" \
             bash "$RENDERED_SCRIPT"
           PLACEHOLDER_EXIT=$?
@@ -284,7 +302,7 @@ jobs:
           PY
           chmod 0700 "$RENDERED_LOCK_SCRIPT"
 
-          WRAPPER_OUT=$(sudo LAPS_ADMIN_USER="golaps-admin" LAPS_VAULT_TYPE="hashicorp" LAPS_VAULT_ID="laps" \
+          WRAPPER_OUT=$(sudo env LAPS_ADMIN_USER="golaps-admin" LAPS_VAULT_TYPE="hashicorp" LAPS_VAULT_ID="laps" \
             flock -x /var/run/golaps.lock bash "$RENDERED_LOCK_SCRIPT" 2>&1)
           echo "$WRAPPER_OUT"
           if ! grep -q "GoLAPS skipped rotation (exit 75); leaving last_rotation.txt unchanged." <<< "$WRAPPER_OUT"; then
