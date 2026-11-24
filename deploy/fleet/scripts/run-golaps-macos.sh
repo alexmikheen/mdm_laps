@@ -92,6 +92,11 @@ echo "[INFO] Starting GoLAPS rotation..."
 printf '%s\n%s\n' "$LAPS_VAULT_TOKEN" "$LEGACY_ADMIN_PASS" | /usr/bin/caffeinate -i "$LAPS_BINARY" --secrets-from-stdin
 EXIT_CODE=$?
 
+if [ "$EXIT_CODE" -eq 75 ]; then
+    echo "[INFO] GoLAPS skipped rotation (exit 75)."
+    exit 0
+fi
+
 if [ "$EXIT_CODE" -ne 0 ]; then
     echo "[ERROR] GoLAPS failed with exit code $EXIT_CODE."
     exit "$EXIT_CODE"

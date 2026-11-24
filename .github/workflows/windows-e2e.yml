@@ -173,7 +173,7 @@ jobs:
             if (-not $createdNew) { throw "Expected to acquire Global\GoLAPS_RunLock" }
             $out = "golaps-e2e-token`n`n" | & "C:\Program Files\GoLAPS\golaps.exe" --secrets-from-stdin 2>&1 | Out-String
             Write-Host $out
-            if ($LASTEXITCODE -ne 0) { throw "Expected exit 0 when lock is held, got $LASTEXITCODE" }
+            if ($LASTEXITCODE -ne 75) { throw "Expected exit 75 when lock is held, got $LASTEXITCODE" }
             if ($out -notmatch 'Another GoLAPS run holds') { throw "Expected lock-held log message" }
           } finally {
             $mutex.ReleaseMutex()

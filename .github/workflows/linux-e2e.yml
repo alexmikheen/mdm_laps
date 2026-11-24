@@ -54,6 +54,11 @@ jobs:
           TAR_PATH="${STAGE_DIR}/golaps_linux_amd64.tar.gz"
           tar -C "$STAGE_DIR" -czf "$TAR_PATH" golaps
 
+          # GitHub-hosted ubuntu-latest runners ship with mode 0777 on /usr/local/bin.
+          # Harden /usr/local and /usr/local/bin to standard root-only permissions before install.
+          sudo chown root:root /usr/local /usr/local/bin
+          sudo chmod 0755 /usr/local /usr/local/bin
+
           # Test manual tarball-file mode first, then Fleet orbit extracted-directory mode.
           sudo INSTALLER_PATH="$TAR_PATH" bash deploy/fleet/scripts/install-golaps-linux.sh
           tar -xzf "$TAR_PATH" -C "$EXTRACT_DIR"

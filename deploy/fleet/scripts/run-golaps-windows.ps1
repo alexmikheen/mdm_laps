@@ -102,7 +102,7 @@ while ($Parent -and $Parent.TrimEnd('\') -ne $Root) {
 # Remove any stray secret environment variables before starting the child process.
 foreach ($Name in @(
     'LAPS_VAULT_TOKEN', 'OP_SERVICE_ACCOUNT_TOKEN', 'VAULT_TOKEN',
-    'BWS_ACCESS_TOKEN', 'BW_API_KEY', 'AZURE_CLIENT_SECRET',
+    'VAULT_SKIP_VERIFY', 'BWS_ACCESS_TOKEN', 'BW_API_KEY', 'AZURE_CLIENT_SECRET',
     'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'LEGACY_ADMIN_PASS'
 )) {
     Remove-Item -Path "Env:$Name" -ErrorAction SilentlyContinue
@@ -130,6 +130,11 @@ try {
     $VaultToken = $null
     $Bytes = $null
     $Process.Dispose()
+}
+
+if ($ExitCode -eq 75) {
+    Write-Output '[INFO] GoLAPS skipped rotation (exit 75); leaving last_rotation.txt unchanged.'
+    exit 0
 }
 
 if ($ExitCode -ne 0) {
