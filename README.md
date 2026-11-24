@@ -6,9 +6,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go&logoColor=white)](go.mod)
-[![Platforms](https://img.shields.io/badge/Platforms-macOS%20arm64%20%7C%20Windows%20amd64-lightgrey)]()
+[![Platforms](https://img.shields.io/badge/Platforms-macOS%20arm64%20%7C%20Windows%20amd64%20%7C%20Linux%20amd64%2Farm64-lightgrey)]()
 
-GoLAPS rotates managed local administrator passwords on **macOS (Apple Silicon)** and **Windows (x64)** fleets. It stores the new credential in your vault provider before it changes the device account.
+GoLAPS rotates managed local administrator passwords on **macOS (Apple Silicon)**, **Windows (x64)**, and **Linux (amd64 and arm64)** fleets. It stores the new credential in your vault provider before it changes the device account.
 
 You can deploy GoLAPS with any MDM platform, such as [Fleet](docs/fleet-mdm.md), Kandji, Jamf Pro, Microsoft Intune, Mosyle, or SimpleMDM.
 
@@ -44,7 +44,7 @@ On Apple Silicon Macs, the managed administrator account can lack a Secure Token
 
 ## Quick Start
 
-Build the macOS `.pkg` (`golaps`, `mac_helper`, and `golaps_auth`) and the Windows `.exe` (with `.sha256`):
+Build the macOS `.pkg` (`golaps`, `mac_helper`, and `golaps_auth`), the Windows `.exe`, and the Linux binaries (`amd64` and `arm64`, with `.sha256` files):
 
 ```bash
 ./scripts/build/build.sh
@@ -104,7 +104,7 @@ GOLAPS_VERSION="1.0.0" \
 - [cmd](cmd) — entrypoint, capabilities, run locks, and log rotation.
 - [internal/config](internal/config) — managed preferences (`io.github.golaps`), environment variables, and `--secrets-from-stdin` loading.
 - [internal/core](internal/core) — rotation orchestrator and candidate checks.
-- [internal/osmgmt](internal/osmgmt) — macOS and Windows managers, Swift `mac_helper.swift`, and SwiftUI `auth_window.swift`.
+- [internal/osmgmt](internal/osmgmt) — macOS, Windows, and Linux managers, Swift `mac_helper.swift`, and SwiftUI `auth_window.swift`.
 - [internal/password](internal/password) — `crypto/rand` password generator.
 - [internal/vault](internal/vault) — 1Password, HashiCorp Vault, AWS, Azure, and Bitwarden clients.
 - [scripts/build](scripts/build) & [scripts/mdm](scripts/mdm) — release build script and hardened MDM trigger and audit scripts.
