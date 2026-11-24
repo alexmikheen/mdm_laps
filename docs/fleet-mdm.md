@@ -75,3 +75,10 @@ On Fleet Premium, a failing policy triggers the linked script automatically. On 
 - **Fleet secret syntax in PowerShell**: Use `$FLEET_SECRET_GOLAPS_VAULT_TOKEN` inside a single-quoted here-string (`@'...'@`) instead of `$env:FLEET_SECRET_*`. Fleet matches only `$FLEET_SECRET_*` and `${FLEET_SECRET_*}` during upload.
 - **Secrets over `stdin` only**: All trigger scripts pass secrets to `golaps --secrets-from-stdin`. On macOS and Linux, the shell trigger scripts read secrets through single-quoted heredocs and pipe them into `/usr/local/bin/golaps --secrets-from-stdin`. On Windows, `run-golaps-windows.ps1` writes the token to `ProcessStartInfo.StandardInput`. Secrets never appear in process arguments or child environments.
 - **Binary trust checks**: Before rotation, `run-golaps-macos.sh` and `run-golaps-linux.sh` check that `/usr/local/bin/golaps` and every parent directory are root-owned, not symbolic links, and not writable by group or other. On Windows, `run-golaps-windows.ps1` rejects reparse points and requires owner SID `S-1-5-18` (SYSTEM) or `S-1-5-32-544` (Administrators).
+- **Linux package uninstall and host offboarding**: `uninstall-golaps-linux.sh` removes only `/usr/local/bin/golaps`. It keeps the managed administrator account and `/var/lib/golaps` for package updates and reinstalls. When you retire GoLAPS from a Linux host permanently, lock or remove the managed account and remove `/var/lib/golaps`:
+
+```bash
+sudo usermod -L example-admin
+sudo userdel -r example-admin
+sudo rm -rf /var/lib/golaps /var/run/golaps.lock
+```

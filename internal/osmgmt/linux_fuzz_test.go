@@ -15,6 +15,14 @@ func FuzzValidateLinuxSerial(f *testing.F) {
 		"To be filled by O.E.M.",
 		"O.E.M.",
 		"Not Available",
+		"Not Settable",
+		"System Product Name",
+		"Asset-1234567890",
+		"XXXXXXXX",
+		"123456789",
+		"0123456789",
+		"../secret",
+		"a/b?c#d%20",
 		"uninitialized",
 		"00000000-0000-0000-0000-000000000000",
 		"FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF",
@@ -25,7 +33,11 @@ func FuzzValidateLinuxSerial(f *testing.F) {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, raw string) {
-		_, _ = validateLinuxSerial(raw)
+		if got, err := validateLinuxSerial(raw); err == nil {
+			if strings.ContainsAny(got, `/\?#%`) || strings.Contains(got, "..") {
+				t.Fatalf("accepted unsafe path serial %q", got)
+			}
+		}
 	})
 }
 

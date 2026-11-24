@@ -228,15 +228,66 @@ jobs:
           fi
           echo "Negative trust check passed (script refused writable binary with exit ${NEG_EXIT})."
 
-      - name: Verify /var/run/golaps.lock flock blocks concurrent run
+          # Negative placeholder check: verify unedited example-admin placeholder is refused fail-closed.
+          set +e
+          sudo LAPS_ADMIN_USER="example-admin" LAPS_VAULT_TYPE="hashicorp" LAPS_VAULT_ID="laps" \
+            VAULT_ADDR="http://127.0.0.1:18200" LAPS_VAULT_PATH="secret/data/laps" \
+            bash "$RENDERED_SCRIPT"
+          PLACEHOLDER_EXIT=$?
+          set -e
+          if [ "$PLACEHOLDER_EXIT" -eq 0 ]; then
+            echo "::error::Expected run-golaps-linux.sh to fail closed on placeholder LAPS_ADMIN_USER=example-admin"
+            exit 1
+          fi
+          echo "Negative placeholder check passed (script refused example-admin with exit ${PLACEHOLDER_EXIT})."
+
+      - name: Verify /var/run/golaps.lock flock blocks concurrent run with exit 75 and preserves last_rotation.txt
         run: |
           set -euo pipefail
+          MARKER="/var/lib/golaps/last_rotation.txt"
+          SENTINEL_TS="2000-01-01T00:00:00Z"
+          echo "$SENTINEL_TS" | sudo tee "$MARKER" > /dev/null
+          sudo chmod 0644 "$MARKER"
+
+          set +e
           OUT=$(sudo flock -x /var/run/golaps.lock bash -c '
             printf "%s\n\n" "golaps-e2e-token" | /usr/local/bin/golaps --secrets-from-stdin 2>&1
           ')
+          LOCK_EXIT=$?
+          set -e
           echo "$OUT"
+          if [ "$LOCK_EXIT" -ne 75 ]; then
+            echo "::error::Expected exit code 75 (EX_TEMPFAIL) when lock is held, got ${LOCK_EXIT}"
+            exit 1
+          fi
           if ! grep -q "Another GoLAPS run holds" <<< "$OUT"; then
             echo "::error::Expected lock-held log message from concurrent golaps invocation"
             exit 1
           fi
-          echo "flock concurrency test passed."
+
+          RENDERED_LOCK_SCRIPT=$(mktemp /tmp/golaps-lock-test.XXXXXX)
+          trap 'rm -f "$RENDERED_LOCK_SCRIPT"' EXIT
+          python3 - deploy/fleet/scripts/run-golaps-linux.sh "$RENDERED_LOCK_SCRIPT" <<'PY'
+          import sys
+          src_path, dst_path = sys.argv[1], sys.argv[2]
+          with open(src_path, "r", encoding="utf-8") as handle:
+              data = handle.read()
+          data = data.replace("$FLEET_SECRET_GOLAPS_VAULT_TOKEN", "golaps-e2e-token")
+          data = data.replace("$FLEET_SECRET_GOLAPS_LEGACY_PASS", "")
+          with open(dst_path, "w", encoding="utf-8") as handle:
+              handle.write(data)
+          PY
+          chmod 0700 "$RENDERED_LOCK_SCRIPT"
+
+          WRAPPER_OUT=$(sudo LAPS_ADMIN_USER="golaps-admin" LAPS_VAULT_TYPE="hashicorp" LAPS_VAULT_ID="laps" \
+            flock -x /var/run/golaps.lock bash "$RENDERED_LOCK_SCRIPT" 2>&1)
+          echo "$WRAPPER_OUT"
+          if ! grep -q "GoLAPS skipped rotation (exit 75); leaving last_rotation.txt unchanged." <<< "$WRAPPER_OUT"; then
+            echo "::error::Expected skip message from run-golaps-linux.sh when lock is held"
+            exit 1
+          fi
+          if [ "$(cat "$MARKER")" != "$SENTINEL_TS" ]; then
+            echo "::error::Expected $MARKER to remain unchanged ($SENTINEL_TS), got $(cat "$MARKER")"
+            exit 1
+          fi
+          echo "flock concurrency test passed (exit 75 and last_rotation.txt unchanged)."

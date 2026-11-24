@@ -28,9 +28,38 @@ if [ -z "${INSTALLER_PATH:-}" ] || [ -L "$INSTALLER_PATH" ]; then
     exit 1
 fi
 
-for dir in "/usr" "/usr/local"; do
+verify_trusted_dir() {
+    local dir="$1"
     if [ -L "$dir" ] || [ ! -d "$dir" ]; then
-        echo "[ERROR] Refusing to install through untrusted parent directory: $dir." >&2
+        echo "[ERROR] Refusing to install through untrusted directory: $dir." >&2
+        return 1
+    fi
+    local uid mode
+    uid=$(stat -c '%u' "$dir" 2>/dev/null) || {
+        echo "[ERROR] Failed to inspect owner of directory: $dir." >&2
+        return 1
+    }
+    mode=$(stat -c '%a' "$dir" 2>/dev/null) || {
+        echo "[ERROR] Failed to inspect permissions of directory: $dir." >&2
+        return 1
+    }
+    if [ "$uid" != "0" ]; then
+        echo "[ERROR] Untrusted directory: $dir is owned by uid $uid, not root." >&2
+        return 1
+    fi
+    if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]]; then
+        echo "[ERROR] Untrusted directory: $dir has unexpected mode $mode." >&2
+        return 1
+    fi
+    if (( (8#$mode & 022) != 0 )); then
+        echo "[ERROR] Untrusted directory: $dir is writable by group or other (mode $mode)." >&2
+        return 1
+    fi
+    return 0
+}
+
+for dir in "/" "/usr" "/usr/local"; do
+    if ! verify_trusted_dir "$dir"; then
         exit 1
     fi
 done
@@ -47,9 +76,10 @@ fi
 
 if [ ! -d "$INSTALL_DIR" ]; then
     install -d -o root -g root -m 0755 "$INSTALL_DIR"
-else
-    chown root:root "$INSTALL_DIR"
-    chmod 0755 "$INSTALL_DIR"
+fi
+
+if ! verify_trusted_dir "$INSTALL_DIR"; then
+    exit 1
 fi
 
 if [ -L "$TARGET_PATH" ]; then

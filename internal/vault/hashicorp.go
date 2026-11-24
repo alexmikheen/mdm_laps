@@ -5,8 +5,12 @@ package vault
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -18,9 +22,39 @@ type HashiCorpClient struct {
 	path   string
 }
 
-func NewHashiCorpClient(address, token, path string) (*HashiCorpClient, error) {
+func newHashiCorpConfig(address string) (*api.Config, error) {
 	config := api.DefaultConfig()
+	if config.Error != nil {
+		return nil, fmt.Errorf("failed to initialize vault config: %w", config.Error)
+	}
 	config.Address = address
+
+	// Enforce TLS verification even if VAULT_SKIP_VERIFY is set in the environment.
+	if config.HttpClient == nil {
+		return nil, errors.New("vault HTTP client is not initialized")
+	}
+	transport, ok := config.HttpClient.Transport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("unsupported vault HTTP transport %T", config.HttpClient.Transport)
+	}
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	transport.TLSClientConfig.InsecureSkipVerify = false
+	if transport.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+		transport.TLSClientConfig.MinVersion = tls.VersionTLS12
+	}
+	if err := config.ConfigureTLS(&api.TLSConfig{Insecure: false}); err != nil {
+		return nil, fmt.Errorf("failed to configure vault TLS: %w", err)
+	}
+	return config, nil
+}
+
+func NewHashiCorpClient(address, token, path string) (*HashiCorpClient, error) {
+	config, err := newHashiCorpConfig(address)
+	if err != nil {
+		return nil, err
+	}
 
 	client, err := api.NewClient(config)
 	if err != nil {
@@ -49,9 +83,14 @@ func (hc *HashiCorpClient) isKVv2() bool {
 	return strings.Contains(hc.path, "/data/") || strings.HasSuffix(hc.path, "/data")
 }
 
+// secretPath returns the Vault path with deviceID escaped as a single path segment.
+func (hc *HashiCorpClient) secretPath(deviceID string) string {
+	return strings.TrimRight(hc.path, "/") + "/" + url.PathEscape(deviceID)
+}
+
 // readData returns the device's current secret data, or an empty map when the secret does not exist yet.
 func (hc *HashiCorpClient) readData(ctx context.Context, deviceID string) (map[string]interface{}, error) {
-	return hc.readDataAt(ctx, hc.path+"/"+deviceID)
+	return hc.readDataAt(ctx, hc.secretPath(deviceID))
 }
 
 func (hc *HashiCorpClient) readDataAt(ctx context.Context, fullPath string) (map[string]interface{}, error) {
@@ -93,7 +132,7 @@ func (hc *HashiCorpClient) GetCredentials(ctx context.Context, deviceID, vaultID
 	if len(data) == 0 {
 		return res, nil
 	}
-	res.ItemID = hc.path + "/" + deviceID
+	res.ItemID = hc.secretPath(deviceID)
 
 	if oldLogin, ok := data["login"].(string); ok && oldLogin != "" {
 		res.OldLogin = oldLogin
@@ -141,10 +180,11 @@ func (hc *HashiCorpClient) StagePendingPassword(ctx context.Context, creds *Cred
 	}
 	data["pending_password"] = newPassword
 
-	if err := hc.writeDataAt(ctx, hc.path+"/"+deviceID, data); err != nil {
+	fullPath := hc.secretPath(deviceID)
+	if err := hc.writeDataAt(ctx, fullPath, data); err != nil {
 		return fmt.Errorf("could not stage the pending password: %w", err)
 	}
-	creds.ItemID = hc.path + "/" + deviceID
+	creds.ItemID = fullPath
 	return nil
 }
 
@@ -191,7 +231,7 @@ func (hc *HashiCorpClient) ConfirmLivePassword(ctx context.Context, creds *Crede
 	data["password"] = live
 	delete(data, "pending_password")
 	delete(data, "previous_pending_password")
-	if err := hc.writeDataAt(ctx, hc.path+"/"+deviceID, data); err != nil {
+	if err := hc.writeDataAt(ctx, hc.secretPath(deviceID), data); err != nil {
 		return err
 	}
 	creds.recordConfirmed(login, live)
@@ -264,7 +304,7 @@ func (hc *HashiCorpClient) UpsertCredentials(ctx context.Context, creds *Credent
 	delete(data, "pending_password")
 	delete(data, "previous_pending_password")
 
-	return hc.writeDataAt(ctx, hc.path+"/"+deviceID, data)
+	return hc.writeDataAt(ctx, hc.secretPath(deviceID), data)
 }
 
 // Helper to parse legacy data

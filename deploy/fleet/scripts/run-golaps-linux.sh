@@ -77,6 +77,17 @@ verify_trusted_binary() {
     return 0
 }
 
+# Abort if placeholder configuration values were left unedited.
+if [ -z "$LAPS_ADMIN_USER" ] || [ "$LAPS_ADMIN_USER" = "example-admin" ]; then
+    echo "[ERROR] LAPS_ADMIN_USER is empty or still set to the placeholder value 'example-admin'." >&2
+    exit 1
+fi
+
+if [ -z "$LAPS_VAULT_ID" ] || [ "$LAPS_VAULT_ID" = "your-vault-id" ]; then
+    echo "[ERROR] LAPS_VAULT_ID is empty or still set to the placeholder value 'your-vault-id'." >&2
+    exit 1
+fi
+
 # Abort if the Fleet secret was not substituted or is empty.
 # Split the literal marker so Fleet does not substitute inside the check.
 if [ -z "$GOLAPS_SECRET_TOKEN" ] || [ "$GOLAPS_SECRET_TOKEN" = '$''FLEET_SECRET_GOLAPS_VAULT_TOKEN' ]; then
@@ -94,16 +105,22 @@ if ! verify_trusted_binary "$LAPS_BINARY"; then
     exit 1
 fi
 
-# Scrub any stray secret environment variables before starting GoLAPS.
+# Scrub any stray secret or TLS-bypass environment variables before starting GoLAPS.
 unset LAPS_VAULT_TOKEN OP_SERVICE_ACCOUNT_TOKEN VAULT_TOKEN \
     BWS_ACCESS_TOKEN BW_API_KEY AZURE_CLIENT_SECRET \
-    AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN LEGACY_ADMIN_PASS
+    AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN LEGACY_ADMIN_PASS \
+    VAULT_SKIP_VERIFY
 
 echo "[INFO] Starting GoLAPS rotation..."
 
 # Pass secrets over stdin only so they never appear in argv or child environments.
 printf '%s\n%s\n' "$GOLAPS_SECRET_TOKEN" "$GOLAPS_SECRET_LEGACY" | "$LAPS_BINARY" --secrets-from-stdin
 EXIT_CODE=$?
+
+if [ "$EXIT_CODE" -eq 75 ]; then
+    echo "[INFO] GoLAPS skipped rotation (exit 75); leaving last_rotation.txt unchanged."
+    exit 0
+fi
 
 if [ "$EXIT_CODE" -ne 0 ]; then
     echo "[ERROR] GoLAPS failed with exit code $EXIT_CODE." >&2

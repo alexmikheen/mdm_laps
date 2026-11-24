@@ -26,11 +26,32 @@ const (
 	localLogPath     = "/Library/Logs/golaps.log"
 	localLogMaxLines = 2000
 
-	mdmKillLimit    = 60 * time.Minute
-	runBudget       = mdmKillLimit - 5*time.Minute
-	minRunBudget    = 20 * time.Minute
-	startupDelayEnv = "LAPS_STARTUP_DELAY_SECONDS"
+	mdmKillLimit     = 60 * time.Minute
+	runBudget        = mdmKillLimit - 5*time.Minute
+	minRunBudget     = 20 * time.Minute
+	startupDelayEnv  = "LAPS_STARTUP_DELAY_SECONDS"
+	exitCodeTempFail = 75
 )
+
+func runLockExitCode(held bool, err error) int {
+	if err != nil {
+		return 1
+	}
+	if held {
+		return exitCodeTempFail
+	}
+	return 0
+}
+
+func preflightExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	if errors.Is(err, osmgmt.ErrSkipRun) {
+		return exitCodeTempFail
+	}
+	return 1
+}
 
 func effectiveRunBudget(delayEnv string) time.Duration {
 	budget := runBudget
@@ -134,12 +155,13 @@ func main() {
 
 	// Acquire the run lock before rotating the log so an overlapping process cannot unlink the active log inode.
 	lock, held, err := acquireRunLock(runLockPath)
-	if err != nil {
-		log.Printf("[WARNING] Could not take the run lock %s: %v", runLockPath, err)
-	}
-	if held {
-		log.Printf("[INFO] Another GoLAPS run holds %s; this run exits and leaves the rotation to it.", runLockPath)
-		os.Exit(0)
+	if code := runLockExitCode(held, err); code != 0 {
+		if err != nil {
+			log.Printf("[ERROR] Could not take the run lock %s: %v", runLockPath, err)
+		} else {
+			log.Printf("[INFO] Another GoLAPS run holds %s; this run exits and leaves the rotation to it.", runLockPath)
+		}
+		os.Exit(code)
 	}
 	runLock = lock
 
@@ -187,10 +209,10 @@ func main() {
 	}
 
 	if err := osMgr.Preflight(ctx, cfg.AdminUser, cfg.ProbeURL); err != nil {
-		if errors.Is(err, osmgmt.ErrSkipRun) {
+		if code := preflightExitCode(err); code == exitCodeTempFail {
 			log.Printf("[INFO] Run skipped: %v", err)
 			closeLocalLog()
-			os.Exit(0)
+			os.Exit(code)
 		}
 		fail("[ERROR] %v", err)
 	}

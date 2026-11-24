@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -23,22 +24,47 @@ const linuxNetworkProbeTimeout = 10 * time.Second
 
 // LinuxManager manages local administrator accounts on Linux systems.
 type LinuxManager struct {
-	geteuid  func() int
-	readFile func(string) ([]byte, error)
-	stat     func(string) (os.FileInfo, error)
-	probe    func(ctx context.Context, probeURL string) error
-	runCmd   func(ctx context.Context, stdin, secret, name string, args ...string) (string, error)
+	geteuid      func() int
+	readFile     func(string) ([]byte, error)
+	stat         func(string) (os.FileInfo, error)
+	lstat        func(string) (os.FileInfo, error)
+	evalSymlinks func(string) (string, error)
+	fileOwner    func(os.FileInfo) (uint32, bool)
+	probe        func(ctx context.Context, probeURL string) error
+	runCmd       func(ctx context.Context, stdin, secret, name string, args ...string) (string, error)
 }
 
 // NewManager returns a LinuxManager configured with live system calls.
 func NewManager() Manager {
 	return &LinuxManager{
-		geteuid:  os.Geteuid,
-		readFile: os.ReadFile,
-		stat:     os.Stat,
-		probe:    probeLinuxEndpoint,
-		runCmd:   runLinuxCommand,
+		geteuid:      os.Geteuid,
+		readFile:     os.ReadFile,
+		stat:         os.Stat,
+		lstat:        os.Lstat,
+		evalSymlinks: filepath.EvalSymlinks,
+		fileOwner:    linuxFileInfoUID,
+		probe:        probeLinuxEndpoint,
+		runCmd:       runLinuxCommand,
 	}
+}
+
+func linuxFileInfoUID(info os.FileInfo) (uint32, bool) {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st != nil {
+		return st.Uid, true
+	}
+	if owner, ok := info.(linuxFileOwner); ok {
+		return owner.OwnerUID(), true
+	}
+	return 0, false
+}
+
+func (m *LinuxManager) resolveTool(name string) (string, error) {
+	return resolveLinuxTool(name, linuxToolFS{
+		stat:         m.stat,
+		lstat:        m.lstat,
+		evalSymlinks: m.evalSymlinks,
+		fileOwner:    m.fileOwner,
+	})
 }
 
 func runLinuxCommand(ctx context.Context, stdin, secret, name string, args ...string) (string, error) {
@@ -125,7 +151,7 @@ func (m *LinuxManager) GetSystemInfo(ctx context.Context) (string, string, error
 	return hostname, serial, nil
 }
 
-// EnsureUserAndChangePassword provisions user, sets the password via chpasswd stdin, unlocks the account, disables expiry, and grants admin group membership.
+// EnsureUserAndChangePassword provisions a local managed user, rotates its password via chpasswd stdin, unlocks it, disables expiry, grants admin membership, and verifies sudo escalation.
 func (m *LinuxManager) EnsureUserAndChangePassword(ctx context.Context, user string, candidates []string, newPass string) error {
 	if err := validateChpasswdInput(user, newPass); err != nil {
 		return err
@@ -134,30 +160,50 @@ func (m *LinuxManager) EnsureUserAndChangePassword(ctx context.Context, user str
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
-	idBin, err := resolveLinuxTool("id", m.stat)
+	usermodBin, err := m.resolveTool("usermod")
 	if err != nil {
 		return err
 	}
-	usermodBin, err := resolveLinuxTool("usermod", m.stat)
+	chpasswdBin, err := m.resolveTool("chpasswd")
 	if err != nil {
 		return err
 	}
-	chpasswdBin, err := resolveLinuxTool("chpasswd", m.stat)
-	if err != nil {
-		return err
-	}
-	getentBin, err := resolveLinuxTool("getent", m.stat)
+	getentBin, err := m.resolveTool("getent")
 	if err != nil {
 		return err
 	}
 
-	if _, err := m.runCmd(ctx, "", "", idBin, "--", user); err != nil {
-		useraddBin, err := resolveLinuxTool("useradd", m.stat)
+	passwdData, err := m.readFile(linuxPasswdPath)
+	if err != nil {
+		return fmt.Errorf("could not read %s: %w", linuxPasswdPath, err)
+	}
+	localEntry, localExists := lookupLocalPasswd(string(passwdData), user)
+
+	if localExists {
+		uidMin := defaultLinuxUIDMin
+		if defsData, err := m.readFile(linuxLoginDefsPath); err == nil {
+			uidMin = parseLoginDefsUIDMin(string(defsData))
+		}
+		if err := validateManagedLocalAccount(localEntry, uidMin); err != nil {
+			return err
+		}
+		if nssOut, err := m.runCmd(ctx, "", "", getentBin, "passwd", "--", user); err == nil {
+			if nssEntry, ok := lookupLocalPasswd(nssOut, user); ok && nssEntry.UID != localEntry.UID {
+				return fmt.Errorf("refusing to manage account %q: NSS uid %d conflicts with local uid %d", user, nssEntry.UID, localEntry.UID)
+			}
+		}
+	} else {
+		if nssOut, err := m.runCmd(ctx, "", "", getentBin, "passwd", "--", user); err == nil {
+			if _, ok := lookupLocalPasswd(nssOut, user); ok {
+				return fmt.Errorf("refusing to manage external NSS account %q (not found in %s)", user, linuxPasswdPath)
+			}
+		}
+		useraddBin, err := m.resolveTool("useradd")
 		if err != nil {
 			return err
 		}
 		shell := selectLinuxShell(m.stat)
-		if _, err := m.runCmd(ctx, "", "", useraddBin, "-m", "-s", shell, "-c", "GoLAPS managed local administrator", "--", user); err != nil {
+		if _, err := m.runCmd(ctx, "", "", useraddBin, "-m", "-s", shell, "-c", linuxManagedGECOS, "--", user); err != nil {
 			return fmt.Errorf("failed to create user %s: %w", user, err)
 		}
 		log.Printf("[INFO] %s: ACCOUNT_CREATED\n", user)
@@ -173,20 +219,32 @@ func (m *LinuxManager) EnsureUserAndChangePassword(ctx context.Context, user str
 		return fmt.Errorf("failed to unlock %s: %w", user, err)
 	}
 
-	if chageBin, err := resolveLinuxTool("chage", m.stat); err == nil {
+	if chageBin, err := m.resolveTool("chage"); err == nil {
 		if _, err := m.runCmd(ctx, "", "", chageBin, "-E", "-1", "-M", "-1", "--", user); err != nil {
 			return fmt.Errorf("failed to disable password expiry for %s: %w", user, err)
 		}
 	}
 
 	adminGroup, err := detectLinuxAdminGroup(func(group string) (string, error) {
-		return m.runCmd(ctx, "", "", getentBin, "group", group)
+		return m.runCmd(ctx, "", "", getentBin, "group", "--", group)
 	})
 	if err != nil {
 		return err
 	}
 	if _, err := m.runCmd(ctx, "", "", usermodBin, "-aG", adminGroup, "--", user); err != nil {
 		return fmt.Errorf("failed to add %s to group %s: %w", user, adminGroup, err)
+	}
+
+	sudoBin, err := m.resolveTool("sudo")
+	if err != nil {
+		return fmt.Errorf("sudo is required to verify admin escalation for %s: %w", user, err)
+	}
+	sudoOut, err := m.runCmd(ctx, "", "", sudoBin, "-l", "-U", user)
+	if err != nil {
+		return fmt.Errorf("sudo privilege verification failed for %s: %w", user, err)
+	}
+	if err := verifySudoEscalation(sudoOut); err != nil {
+		return fmt.Errorf("user %s does not have effective sudo escalation: %w", user, err)
 	}
 	log.Printf("[INFO] %s: ADMIN_GRANTED (%s)\n", user, adminGroup)
 

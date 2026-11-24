@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 type linuxFakeFileInfo struct {
 	name string
 	mode fs.FileMode
+	uid  uint32
 }
 
 func (f linuxFakeFileInfo) Name() string       { return f.name }
@@ -23,6 +25,55 @@ func (f linuxFakeFileInfo) Mode() fs.FileMode  { return f.mode }
 func (f linuxFakeFileInfo) ModTime() time.Time { return time.Time{} }
 func (f linuxFakeFileInfo) IsDir() bool        { return f.mode.IsDir() }
 func (f linuxFakeFileInfo) Sys() any           { return nil }
+func (f linuxFakeFileInfo) OwnerUID() uint32   { return f.uid }
+
+func linuxBaseRootTree() map[string]linuxFakeFileInfo {
+	return map[string]linuxFakeFileInfo{
+		"/":         {name: "/", mode: fs.ModeDir | 0o755, uid: 0},
+		"/usr":      {name: "usr", mode: fs.ModeDir | 0o755, uid: 0},
+		"/usr/sbin": {name: "sbin", mode: fs.ModeDir | 0o755, uid: 0},
+		"/usr/bin":  {name: "bin", mode: fs.ModeDir | 0o755, uid: 0},
+		"/sbin":     {name: "sbin", mode: fs.ModeDir | 0o755, uid: 0},
+		"/bin":      {name: "bin", mode: fs.ModeDir | 0o755, uid: 0},
+	}
+}
+
+func makeLinuxToolFS(entries map[string]linuxFakeFileInfo, symlinks map[string]string) linuxToolFS {
+	stat := func(p string) (os.FileInfo, error) {
+		if target, ok := symlinks[p]; ok {
+			p = target
+		}
+		info, ok := entries[p]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return info, nil
+	}
+	lstat := func(p string) (os.FileInfo, error) {
+		if _, ok := symlinks[p]; ok {
+			return linuxFakeFileInfo{name: path.Base(p), mode: fs.ModeSymlink | 0o777, uid: 0}, nil
+		}
+		info, ok := entries[p]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return info, nil
+	}
+	evalSymlinks := func(p string) (string, error) {
+		if target, ok := symlinks[p]; ok {
+			return target, nil
+		}
+		if _, ok := entries[p]; !ok {
+			return "", os.ErrNotExist
+		}
+		return p, nil
+	}
+	return linuxToolFS{
+		stat:         stat,
+		lstat:        lstat,
+		evalSymlinks: evalSymlinks,
+	}
+}
 
 func TestLinuxChildEnvIsClean(t *testing.T) {
 	t.Setenv("OP_SERVICE_ACCOUNT_TOKEN", "must-not-leak")
@@ -43,18 +94,32 @@ func TestValidateLinuxSerial(t *testing.T) {
 		"To be filled by O.E.M.",
 		"TO BE FILLED BY O.E.M.",
 		"Default string",
+		"Default",
 		"0",
 		"00000000",
 		"00000000-0000-0000-0000-000000000000",
 		"FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF",
 		"ffffffffffffffff",
+		"XXXXXXXX",
+		"1111-1111-1111",
+		"--------",
+		"123456789",
+		"0123456789",
+		"1234567890",
+		"987654321",
+		"abcdefgh",
 		"System Serial Number",
+		"System Product Name",
 		"Chassis Serial Number",
+		"Chassis Asset Tag",
 		"Board Serial Number",
 		"Base Board Serial Number",
 		"Not Specified",
+		"Not Settable",
 		"Not Applicable",
 		"Not Available",
+		"Asset-1234567890",
+		"asset-tag",
 		"None",
 		"N/A",
 		"Invalid",
@@ -65,6 +130,14 @@ func TestValidateLinuxSerial(t *testing.T) {
 		"bad\x00serial",
 		"bad\x1bserial",
 		"line1\nline2",
+		"../other",
+		"a/b",
+		`a\b`,
+		"abc..def",
+		"abc?foo=1",
+		"abc#frag",
+		"abc%20def",
+		".",
 	}
 	for _, bad := range badValues {
 		if got, err := validateLinuxSerial(bad); err == nil {
@@ -97,8 +170,8 @@ func TestSelectLinuxSerialFallbackOrder(t *testing.T) {
 		"/sys/class/dmi/id/product_uuid":   "7967FCD2-0CE4-4C0E-AE6C-F66536181D11\n",
 		"/etc/machine-id":                  "4c8f2b1e9a7d4c3b8e1f0a2d5c6b7e8f\n",
 	}
-	readFile := func(path string) ([]byte, error) {
-		val, ok := files[path]
+	readFile := func(p string) ([]byte, error) {
+		val, ok := files[p]
 		if !ok {
 			return nil, os.ErrNotExist
 		}
@@ -175,44 +248,99 @@ func TestScrubSecret(t *testing.T) {
 	}
 }
 
-func TestResolveLinuxTool(t *testing.T) {
-	entries := map[string]linuxFakeFileInfo{
-		"/usr/sbin/chpasswd": {name: "chpasswd", mode: 0o755},
-		"/sbin/usermod":      {name: "usermod", mode: 0o755},
-		"/usr/bin/id":        {name: "id", mode: 0o755},
-		"/usr/sbin/badfile":  {name: "badfile", mode: 0o644},
-		"/usr/sbin/baddir":   {name: "baddir", mode: fs.ModeDir | 0o755},
-	}
-	stat := func(path string) (os.FileInfo, error) {
-		info, ok := entries[path]
-		if !ok {
-			return nil, os.ErrNotExist
-		}
-		return info, nil
+func TestLookupLocalPasswdAndAccountGuard(t *testing.T) {
+	passwd := strings.Join([]string{
+		"root:x:0:0:root:/root:/bin/bash",
+		"toor:x:0:0:GoLAPS managed:/root:/bin/bash",
+		"www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin",
+		"syslaps:x:999:999:GoLAPS managed:/home/syslaps:/bin/bash",
+		"alice:x:1001:1001:Alice Smith:/home/alice:/bin/bash",
+		"lapsadmin:x:1002:1002:GoLAPS managed:/home/lapsadmin:/bin/bash",
+		"legacy:x:1003:1003:GoLAPS managed local administrator:/home/legacy:/bin/bash",
+	}, "\n")
+
+	if _, ok := lookupLocalPasswd(passwd, "missing"); ok {
+		t.Fatal("lookupLocalPasswd found nonexistent user")
 	}
 
-	got, err := resolveLinuxTool("chpasswd", stat)
-	if err != nil || got != "/usr/sbin/chpasswd" {
-		t.Fatalf("resolveLinuxTool(chpasswd) = (%q, %v)", got, err)
+	uidMin := parseLoginDefsUIDMin("# comment\nUID_MIN\t1000\nUID_MAX 60000\n")
+	if uidMin != 1000 {
+		t.Fatalf("parseLoginDefsUIDMin = %d, want 1000", uidMin)
 	}
-	got, err = resolveLinuxTool("usermod", stat)
-	if err != nil || got != "/sbin/usermod" {
-		t.Fatalf("resolveLinuxTool(usermod) = (%q, %v)", got, err)
+	if custom := parseLoginDefsUIDMin("UID_MIN 500\n"); custom != 500 {
+		t.Fatalf("parseLoginDefsUIDMin(500) = %d, want 500", custom)
 	}
-	got, err = resolveLinuxTool("id", stat)
-	if err != nil || got != "/usr/bin/id" {
-		t.Fatalf("resolveLinuxTool(id) = (%q, %v)", got, err)
+	if def := parseLoginDefsUIDMin(""); def != 1000 {
+		t.Fatalf("parseLoginDefsUIDMin(empty) = %d, want 1000", def)
 	}
-	for _, bad := range []string{"", "../chpasswd", "missing", "badfile", "baddir"} {
-		if p, err := resolveLinuxTool(bad, stat); err == nil {
-			t.Fatalf("resolveLinuxTool(%q) = %q, want error", bad, p)
+
+	for _, rejectUser := range []string{"root", "toor", "www-data", "syslaps", "alice"} {
+		entry, ok := lookupLocalPasswd(passwd, rejectUser)
+		if !ok {
+			t.Fatalf("expected %s in passwd fixture", rejectUser)
+		}
+		if err := validateManagedLocalAccount(entry, uidMin); err == nil {
+			t.Fatalf("validateManagedLocalAccount(%s) succeeded, want error", rejectUser)
+		}
+	}
+	for _, allowUser := range []string{"lapsadmin", "legacy"} {
+		entry, ok := lookupLocalPasswd(passwd, allowUser)
+		if !ok {
+			t.Fatalf("expected %s in passwd fixture", allowUser)
+		}
+		if err := validateManagedLocalAccount(entry, uidMin); err != nil {
+			t.Fatalf("validateManagedLocalAccount(%s) failed: %v", allowUser, err)
 		}
 	}
 }
 
+func TestResolveLinuxToolTrustAndUsrmerge(t *testing.T) {
+	entries := linuxBaseRootTree()
+	entries["/usr/sbin/chpasswd"] = linuxFakeFileInfo{name: "chpasswd", mode: 0o755, uid: 0}
+	entries["/usr/sbin/usermod"] = linuxFakeFileInfo{name: "usermod", mode: 0o755, uid: 0}
+	entries["/usr/bin/sudo"] = linuxFakeFileInfo{name: "sudo", mode: fs.ModeSetuid | 0o755, uid: 0}
+	entries["/usr/sbin/badfile"] = linuxFakeFileInfo{name: "badfile", mode: 0o644, uid: 0}
+	entries["/usr/sbin/baddir"] = linuxFakeFileInfo{name: "baddir", mode: fs.ModeDir | 0o755, uid: 0}
+	entries["/usr/sbin/nonroot"] = linuxFakeFileInfo{name: "nonroot", mode: 0o755, uid: 1000}
+	entries["/usr/sbin/writable"] = linuxFakeFileInfo{name: "writable", mode: 0o775, uid: 0}
+	entries["/tmp"] = linuxFakeFileInfo{name: "tmp", mode: fs.ModeDir | 0o777, uid: 0}
+	entries["/tmp/evil"] = linuxFakeFileInfo{name: "evil", mode: 0o755, uid: 0}
+
+	symlinks := map[string]string{
+		"/sbin/usrmerged": "/usr/sbin/usermod",
+		"/usr/sbin/evil":  "/tmp/evil",
+	}
+	toolFS := makeLinuxToolFS(entries, symlinks)
+
+	got, err := resolveLinuxTool("chpasswd", toolFS)
+	if err != nil || got != "/usr/sbin/chpasswd" {
+		t.Fatalf("resolveLinuxTool(chpasswd) = (%q, %v)", got, err)
+	}
+	got, err = resolveLinuxTool("usrmerged", toolFS)
+	if err != nil || got != "/usr/sbin/usermod" {
+		t.Fatalf("resolveLinuxTool(usrmerged) = (%q, %v), want /usr/sbin/usermod", got, err)
+	}
+	got, err = resolveLinuxTool("sudo", toolFS)
+	if err != nil || got != "/usr/bin/sudo" {
+		t.Fatalf("resolveLinuxTool(sudo) = (%q, %v)", got, err)
+	}
+
+	for _, bad := range []string{"", ".", "..", "../chpasswd", "missing", "badfile", "baddir", "nonroot", "writable", "evil"} {
+		if p, err := resolveLinuxTool(bad, toolFS); err == nil {
+			t.Fatalf("resolveLinuxTool(%q) = %q, want error", bad, p)
+		}
+	}
+
+	// Untrusted parent directory must fail closed.
+	entries["/usr/sbin"] = linuxFakeFileInfo{name: "sbin", mode: fs.ModeDir | 0o775, uid: 0}
+	if p, err := resolveLinuxTool("chpasswd", toolFS); err == nil {
+		t.Fatalf("resolveLinuxTool accepted binary in group-writable directory: %q", p)
+	}
+}
+
 func TestSelectLinuxShell(t *testing.T) {
-	withBash := func(path string) (os.FileInfo, error) {
-		if path == "/bin/bash" {
+	withBash := func(p string) (os.FileInfo, error) {
+		if p == "/bin/bash" {
 			return linuxFakeFileInfo{name: "bash", mode: 0o755}, nil
 		}
 		return nil, os.ErrNotExist
@@ -221,7 +349,7 @@ func TestSelectLinuxShell(t *testing.T) {
 		t.Fatalf("selectLinuxShell(withBash) = %q, want /bin/bash", got)
 	}
 
-	withoutBash := func(path string) (os.FileInfo, error) {
+	withoutBash := func(p string) (os.FileInfo, error) {
 		return nil, os.ErrNotExist
 	}
 	if got := selectLinuxShell(withoutBash); got != "/bin/sh" {
@@ -264,5 +392,79 @@ func TestDetectLinuxAdminGroup(t *testing.T) {
 	}
 	if _, err := detectLinuxAdminGroup(malformed); err == nil {
 		t.Fatal("detectLinuxAdminGroup(malformed) succeeded, want error")
+	}
+}
+
+func TestVerifySudoEscalation(t *testing.T) {
+	valid := []struct {
+		name string
+		out  string
+	}{
+		{
+			name: "ubuntu sudo group",
+			out: "Matching Defaults entries for lapsadmin on ubuntu:\n" +
+				"    env_reset, mail_badpass, use_pty\n\n" +
+				"User lapsadmin may run the following commands on ubuntu:\n" +
+				"    (ALL : ALL) ALL\n",
+		},
+		{
+			name: "rhel wheel group",
+			out: "Matching Defaults entries for lapsadmin on rocky:\n" +
+				"    !visiblepw, always_set_home, env_reset\n\n" +
+				"User lapsadmin may run the following commands on rocky:\n" +
+				"    (ALL) ALL\n",
+		},
+		{
+			name: "nopasswd all",
+			out: "User lapsadmin may run the following commands on host:\n" +
+				"    (ALL:ALL) NOPASSWD: SETENV: ALL\n",
+		},
+		{
+			name: "targetpw disabled by override",
+			out: "Matching Defaults entries for lapsadmin on suse:\n" +
+				"    env_reset, targetpw, !targetpw\n\n" +
+				"User lapsadmin may run the following commands on suse:\n" +
+				"    (ALL) ALL\n",
+		},
+	}
+	for _, tc := range valid {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := verifySudoEscalation(tc.out); err != nil {
+				t.Fatalf("verifySudoEscalation failed: %v", err)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name string
+		out  string
+	}{
+		{
+			name: "opensuse targetpw enabled",
+			out: "Matching Defaults entries for lapsadmin on opensuse:\n" +
+				"    always_set_home, env_reset, targetpw\n\n" +
+				"User lapsadmin may run the following commands on opensuse:\n" +
+				"    (ALL) ALL\n",
+		},
+		{
+			name: "not allowed",
+			out:  "User lapsadmin is not allowed to run sudo on host.\n",
+		},
+		{
+			name: "restricted command only",
+			out: "User lapsadmin may run the following commands on host:\n" +
+				"    (ALL) /usr/bin/id\n",
+		},
+		{
+			name: "empty output",
+			out:  "",
+		},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := verifySudoEscalation(tc.out); err == nil {
+				t.Fatalf("verifySudoEscalation succeeded for %q, want error", tc.name)
+			}
+		})
 	}
 }
