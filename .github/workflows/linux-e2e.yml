@@ -159,7 +159,8 @@ jobs:
             | python3 -c '
           import json, sys
           d = json.load(sys.stdin)["data"]["data"]
-          assert d.get("login") == "golaps-admin", f"unexpected login: {d.get(\"login\")}"
+          login = d.get("login")
+          assert login == "golaps-admin", f"unexpected login: {login}"
           pw = d.get("password", "")
           assert len(pw) >= 16, "password too short"
           assert "pending_password" not in d, "pending_password was not cleared"
@@ -180,7 +181,8 @@ jobs:
             | python3 -c '
           import json, sys
           d = json.load(sys.stdin)["data"]["data"]
-          assert d.get("login") == "golaps-admin", f"unexpected login: {d.get(\"login\")}"
+          login = d.get("login")
+          assert login == "golaps-admin", f"unexpected login: {login}"
           pw = d.get("password", "")
           assert len(pw) >= 16, "password too short"
           assert "pending_password" not in d, "pending_password was not cleared on Run 2"
