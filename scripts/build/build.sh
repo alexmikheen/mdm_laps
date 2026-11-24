@@ -2,11 +2,12 @@
 # Copyright 2026 Aleksandr Mikheenko
 # SPDX-License-Identifier: MIT
 
-# Build GoLAPS for macOS (arm64) and Windows (amd64) and package the macOS .pkg.
+# Build GoLAPS for macOS (arm64), Windows (amd64), and Linux (amd64, arm64) and package the macOS .pkg.
 
 PKG_IDENTIFIER="io.github.golaps.mdm-laps"
 MAC_ARCH="arm64"
 WIN_ARCH="amd64"
+LINUX_ARCHES=("amd64" "arm64")
 RELEASE_DIR="release"
 
 # Install paths shared by the .pkg payload and audit_laps_customapp.sh.
@@ -209,6 +210,24 @@ GOOS=windows GOARCH=$WIN_ARCH go build -trimpath -ldflags="-s -w" -o "$RELEASE_D
 
 # Publish the SHA-256 checksum alongside the Windows executable.
 (cd "$RELEASE_DIR" && shasum -a 256 "golaps_windows_${WIN_ARCH}.exe" > "golaps_windows_${WIN_ARCH}.exe.sha256") || log_error_and_exit "Failed to generate the Windows binary checksum."
+
+for LINUX_ARCH in "${LINUX_ARCHES[@]}"; do
+    log_message "Compiling for Linux ($LINUX_ARCH)..."
+    CGO_ENABLED=0 GOOS=linux GOARCH="$LINUX_ARCH" go build -trimpath -ldflags="-s -w" -o "$RELEASE_DIR/golaps_linux_${LINUX_ARCH}" ./cmd || log_error_and_exit "Linux ($LINUX_ARCH) compilation failed!"
+    chmod 755 "$RELEASE_DIR/golaps_linux_${LINUX_ARCH}" || log_error_and_exit "Failed to set executable permissions for Linux ($LINUX_ARCH) binary."
+    (cd "$RELEASE_DIR" && shasum -a 256 "golaps_linux_${LINUX_ARCH}" > "golaps_linux_${LINUX_ARCH}.sha256") || log_error_and_exit "Failed to generate the Linux ($LINUX_ARCH) binary checksum."
+
+    LINUX_STAGE="$RELEASE_DIR/linux_stage_${LINUX_ARCH}"
+    rm -rf "$LINUX_STAGE"
+    mkdir -p "$LINUX_STAGE" || log_error_and_exit "Failed to create Linux staging directory."
+    cp "$RELEASE_DIR/golaps_linux_${LINUX_ARCH}" "$LINUX_STAGE/golaps" || log_error_and_exit "Failed to stage Linux ($LINUX_ARCH) binary."
+    chmod 755 "$LINUX_STAGE/golaps" || log_error_and_exit "Failed to set executable permissions on staged Linux ($LINUX_ARCH) binary."
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$LINUX_STAGE" -czf "$RELEASE_DIR/golaps_linux_${LINUX_ARCH}.tar.gz" golaps 2>/dev/null \
+        || COPYFILE_DISABLE=1 tar -C "$LINUX_STAGE" -czf "$RELEASE_DIR/golaps_linux_${LINUX_ARCH}.tar.gz" golaps \
+        || log_error_and_exit "Failed to archive Linux ($LINUX_ARCH) tarball."
+    rm -rf "$LINUX_STAGE"
+    (cd "$RELEASE_DIR" && shasum -a 256 "golaps_linux_${LINUX_ARCH}.tar.gz" > "golaps_linux_${LINUX_ARCH}.tar.gz.sha256") || log_error_and_exit "Failed to generate the Linux ($LINUX_ARCH) tarball checksum."
+done
 
 log_message "Compiling for macOS ($MAC_ARCH)..."
 GOOS=darwin GOARCH=$MAC_ARCH go build -trimpath -ldflags="-s -w" -o "$PAYLOAD_ROOT$MAC_BINARY_PATH" ./cmd || log_error_and_exit "macOS compilation failed!"

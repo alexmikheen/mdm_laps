@@ -29,10 +29,6 @@ func acquireRunLock(path string) (f *os.File, held bool, err error) {
 	return f, false, nil
 }
 
-func disableCoreDumps() error {
-	return syscall.Setrlimit(syscall.RLIMIT_CORE, &syscall.Rlimit{Cur: 0, Max: 0})
-}
-
 func openLogNoFollow(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
 }

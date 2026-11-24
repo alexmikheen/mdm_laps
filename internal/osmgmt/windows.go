@@ -77,7 +77,7 @@ func (w *WindowsManager) GetSystemInfo(ctx context.Context) (string, string, err
 		hostname = "UnknownHost"
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 
 	out, err := runPowerShell(ctx, serialScript, "")

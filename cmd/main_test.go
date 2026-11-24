@@ -4,11 +4,15 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+
+	"golaps/internal/osmgmt"
 )
 
 func writeLines(t *testing.T, path string, n int) {
@@ -82,5 +86,32 @@ func TestTailCapLogLeavesNoTempFile(t *testing.T) {
 		if strings.HasSuffix(e.Name(), ".tmp") {
 			t.Errorf("left a temporary log copy behind: %s", e.Name())
 		}
+	}
+}
+
+func TestRunLockExitCode(t *testing.T) {
+	if got := runLockExitCode(false, nil); got != 0 {
+		t.Fatalf("runLockExitCode(false, nil) = %d, want 0", got)
+	}
+	if got := runLockExitCode(true, nil); got != exitCodeTempFail {
+		t.Fatalf("runLockExitCode(true, nil) = %d, want %d", got, exitCodeTempFail)
+	}
+	if got := runLockExitCode(false, syscall.ELOOP); got != 1 {
+		t.Fatalf("runLockExitCode(false, ELOOP) = %d, want 1", got)
+	}
+	if got := runLockExitCode(true, errors.New("lock error")); got != 1 {
+		t.Fatalf("runLockExitCode(true, err) = %d, want 1", got)
+	}
+}
+
+func TestPreflightExitCode(t *testing.T) {
+	if got := preflightExitCode(nil); got != 0 {
+		t.Fatalf("preflightExitCode(nil) = %d, want 0", got)
+	}
+	if got := preflightExitCode(fmt.Errorf("battery low: %w", osmgmt.ErrSkipRun)); got != exitCodeTempFail {
+		t.Fatalf("preflightExitCode(ErrSkipRun) = %d, want %d", got, exitCodeTempFail)
+	}
+	if got := preflightExitCode(errors.New("not root")); got != 1 {
+		t.Fatalf("preflightExitCode(other) = %d, want 1", got)
 	}
 }

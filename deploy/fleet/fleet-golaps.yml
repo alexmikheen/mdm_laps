@@ -1,4 +1,4 @@
-# Fleet GitOps configuration for GoLAPS deployment on macOS and Windows.
+# Fleet GitOps configuration for GoLAPS deployment on macOS, Windows, and Linux.
 # Replace placeholder URLs, SHA-256 hashes, and team name before applying.
 name: Workstations
 
@@ -8,9 +8,10 @@ controls:
       # Deploy managed preferences for the io.github.golaps domain.
       - path: ../../profiles/macos/admin_config.mobileconfig
   scripts:
-    # Register macOS and Windows trigger scripts for manual runs and policy automation.
+    # Register macOS, Windows, and Linux trigger scripts for manual runs and policy automation.
     - path: ./scripts/run-golaps-macos.sh
     - path: ./scripts/run-golaps-windows.ps1
+    - path: ./scripts/run-golaps-linux.sh
 
 software:
   packages:
@@ -24,6 +25,28 @@ software:
       self_service: false
       install_script:
         path: ./scripts/install-golaps-windows.ps1
+    # Linux archive (x86_64 / amd64) built by scripts/build/build.sh, installed via install_script.
+    # For mixed-architecture Linux fleets, scope amd64 and arm64 packages with labels_include_any
+    # (or manage arm64 hosts in a dedicated fleet) so arm64 hosts receive the arm64 binary.
+    - url: https://releases.example.com/golaps/golaps_linux_amd64.tar.gz
+      hash_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+      self_service: false
+      # labels_include_any:
+      #   - Linux (x86_64)
+      install_script:
+        path: ./scripts/install-golaps-linux.sh
+      uninstall_script:
+        path: ./scripts/uninstall-golaps-linux.sh
+    # Example ARM64 Linux archive entry for arm64 Linux hosts:
+    # - url: https://releases.example.com/golaps/golaps_linux_arm64.tar.gz
+    #   hash_sha256: 0000000000000000000000000000000000000000000000000000000000000000
+    #   self_service: false
+    #   labels_include_any:
+    #     - Linux (ARM64)
+    #   install_script:
+    #     path: ./scripts/install-golaps-linux.sh
+    #   uninstall_script:
+    #     path: ./scripts/uninstall-golaps-linux.sh
 
 policies:
   # Load GoLAPS compliance and automatic remediation policies.

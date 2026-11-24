@@ -1,0 +1,318 @@
+name: Linux E2E Test
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'deploy/fleet/scripts/install-golaps-linux.sh'
+      - 'deploy/fleet/scripts/uninstall-golaps-linux.sh'
+      - 'deploy/fleet/scripts/run-golaps-linux.sh'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/linux-e2e.yml'
+  pull_request:
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'deploy/fleet/scripts/install-golaps-linux.sh'
+      - 'deploy/fleet/scripts/uninstall-golaps-linux.sh'
+      - 'deploy/fleet/scripts/run-golaps-linux.sh'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/linux-e2e.yml'
+
+jobs:
+  linux-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+
+      - name: Run go vet and race-enabled unit tests on Linux
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - name: Build golaps_linux_amd64.tar.gz and install via Fleet install script
+        run: |
+          set -euo pipefail
+          STAGE_DIR=$(mktemp -d /tmp/golaps-linux-stage.XXXXXX)
+          EXTRACT_DIR=$(mktemp -d /tmp/golaps-linux-extract.XXXXXX)
+          trap 'rm -rf "$STAGE_DIR" "$EXTRACT_DIR"' EXIT
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "${STAGE_DIR}/golaps" ./cmd
+          chmod 0755 "${STAGE_DIR}/golaps"
+          TAR_PATH="${STAGE_DIR}/golaps_linux_amd64.tar.gz"
+          tar -C "$STAGE_DIR" -czf "$TAR_PATH" golaps
+
+          # GitHub-hosted ubuntu-latest runners ship with mode 0777 on /usr/local/bin.
+          # Harden /usr/local and /usr/local/bin to standard root-only permissions before install.
+          sudo chown root:root /usr/local /usr/local/bin
+          sudo chmod 0755 /usr/local /usr/local/bin
+
+          # Test manual tarball-file mode first, then Fleet orbit extracted-directory mode.
+          sudo INSTALLER_PATH="$TAR_PATH" bash deploy/fleet/scripts/install-golaps-linux.sh
+          tar -xzf "$TAR_PATH" -C "$EXTRACT_DIR"
+          sudo INSTALLER_PATH="$EXTRACT_DIR" bash deploy/fleet/scripts/install-golaps-linux.sh
+          test -f /usr/local/bin/golaps
+          test ! -L /usr/local/bin/golaps
+          [ "$(stat -c '%u:%g %a' /usr/local/bin/golaps)" = "0:0 755" ]
+
+      - name: Run Fleet Linux trigger script against local Vault (create + rotate + verify)
+        run: |
+          set -euo pipefail
+
+          VAULT_VERSION="1.18.4"
+          WORK_DIR=$(mktemp -d /tmp/golaps-linux-e2e.XXXXXX)
+          VAULT_PID=""
+          cleanup() {
+            if [ -n "$VAULT_PID" ] && kill -0 "$VAULT_PID" 2>/dev/null; then
+              kill "$VAULT_PID" 2>/dev/null || true
+              wait "$VAULT_PID" 2>/dev/null || true
+            fi
+            sudo chmod 0755 /usr/local/bin/golaps 2>/dev/null || true
+            rm -rf "$WORK_DIR"
+          }
+          trap cleanup EXIT
+
+          ZIP_NAME="vault_${VAULT_VERSION}_linux_amd64.zip"
+          EXPECTED_SHA="bdde42660c14700e4d5275760d50c59ed637803cd9c7c12926a2e2e788097a45"
+          curl -fsSL "https://releases.hashicorp.com/vault/${VAULT_VERSION}/${ZIP_NAME}" -o "${WORK_DIR}/${ZIP_NAME}"
+          ACTUAL_SHA=$(sha256sum "${WORK_DIR}/${ZIP_NAME}" | awk '{print $1}')
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Vault SHA-256 mismatch: expected ${EXPECTED_SHA}, got ${ACTUAL_SHA}"
+            exit 1
+          fi
+
+          unzip -q "${WORK_DIR}/${ZIP_NAME}" -d "${WORK_DIR}/vault-bin"
+          "${WORK_DIR}/vault-bin/vault" server -dev \
+            -dev-root-token-id="golaps-e2e-token" \
+            -dev-listen-address="127.0.0.1:18200" \
+            > "${WORK_DIR}/vault.log" 2>&1 &
+          VAULT_PID=$!
+
+          READY=0
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:18200/v1/sys/health" > /dev/null 2>&1; then
+              READY=1
+              echo "Vault is ready"
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "::error::Vault did not become ready in time"
+            cat "${WORK_DIR}/vault.log"
+            exit 1
+          fi
+
+          # Simulate Fleet server-side secret substitution on run-golaps-linux.sh.
+          RENDERED_SCRIPT="${WORK_DIR}/run-golaps-linux-rendered.sh"
+          python3 - deploy/fleet/scripts/run-golaps-linux.sh "$RENDERED_SCRIPT" <<'PY'
+          import sys
+          src_path, dst_path = sys.argv[1], sys.argv[2]
+          with open(src_path, "r", encoding="utf-8") as handle:
+              data = handle.read()
+          data = data.replace("$FLEET_SECRET_GOLAPS_VAULT_TOKEN", "golaps-e2e-token")
+          data = data.replace("$FLEET_SECRET_GOLAPS_LEGACY_PASS", "")
+          with open(dst_path, "w", encoding="utf-8") as handle:
+              handle.write(data)
+          PY
+          chmod 0700 "$RENDERED_SCRIPT"
+
+          export LAPS_ADMIN_USER="golaps-admin"
+          export LAPS_VAULT_TYPE="hashicorp"
+          export LAPS_VAULT_ID="laps"
+          export VAULT_ADDR="http://127.0.0.1:18200"
+          export LAPS_VAULT_PATH="secret/data/laps"
+
+          echo "=== Run 1: Provision ${LAPS_ADMIN_USER} ==="
+          sudo env \
+            LAPS_ADMIN_USER="$LAPS_ADMIN_USER" \
+            LAPS_VAULT_TYPE="$LAPS_VAULT_TYPE" \
+            LAPS_VAULT_ID="$LAPS_VAULT_ID" \
+            VAULT_ADDR="$VAULT_ADDR" \
+            LAPS_VAULT_PATH="$LAPS_VAULT_PATH" \
+            bash "$RENDERED_SCRIPT"
+
+          # Verify Linux local user exists and belongs to sudo group.
+          id "$LAPS_ADMIN_USER"
+          id -nG "$LAPS_ADMIN_USER" | tr ' ' '\n' | grep -qx "sudo"
+
+          # Read serial and verify Vault record.
+          SERIAL=$(curl -fsS -H "X-Vault-Token: golaps-e2e-token" \
+            "http://127.0.0.1:18200/v1/secret/metadata/laps?list=true" \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["data"]["keys"][0])')
+          echo "Escrowed device serial: ${SERIAL}"
+
+          PASS1=$(curl -fsS -H "X-Vault-Token: golaps-e2e-token" \
+            "http://127.0.0.1:18200/v1/secret/data/laps/${SERIAL}" \
+            | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)["data"]["data"]
+          login = d.get("login")
+          assert login == "golaps-admin", f"unexpected login: {login}"
+          pw = d.get("password", "")
+          assert len(pw) >= 16, "password too short"
+          assert "pending_password" not in d, "pending_password was not cleared"
+          print(pw, end="")
+          ')
+
+          echo "=== Run 2: Rotate ${LAPS_ADMIN_USER} password ==="
+          sudo env \
+            LAPS_ADMIN_USER="$LAPS_ADMIN_USER" \
+            LAPS_VAULT_TYPE="$LAPS_VAULT_TYPE" \
+            LAPS_VAULT_ID="$LAPS_VAULT_ID" \
+            VAULT_ADDR="$VAULT_ADDR" \
+            LAPS_VAULT_PATH="$LAPS_VAULT_PATH" \
+            bash "$RENDERED_SCRIPT"
+
+          PASS2=$(curl -fsS -H "X-Vault-Token: golaps-e2e-token" \
+            "http://127.0.0.1:18200/v1/secret/data/laps/${SERIAL}" \
+            | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)["data"]["data"]
+          login = d.get("login")
+          assert login == "golaps-admin", f"unexpected login: {login}"
+          pw = d.get("password", "")
+          assert len(pw) >= 16, "password too short"
+          assert "pending_password" not in d, "pending_password was not cleared on Run 2"
+          print(pw, end="")
+          ')
+
+          if [ "$PASS2" = "$PASS1" ]; then
+            echo "::error::Password did not change on Run 2"
+            exit 1
+          fi
+
+          # Verify real password hash in /etc/shadow accepts PASS2 and rejects PASS1.
+          printf '%s\n%s\n' "$PASS2" "$PASS1" | sudo python3 -c '
+          import ctypes, sys
+          user = sys.argv[1]
+          lines = sys.stdin.read().splitlines()
+          assert len(lines) == 2, "expected two passwords on stdin"
+          new_pw, old_pw = lines[0], lines[1]
+          shadow_hash = ""
+          with open("/etc/shadow", "r", encoding="utf-8") as handle:
+              for line in handle:
+                  parts = line.rstrip("\n").split(":")
+                  if parts[0] == user:
+                      shadow_hash = parts[1]
+                      break
+          assert shadow_hash and not shadow_hash.startswith(("!", "*")), f"account locked or missing hash for {user}"
+          libcrypt = ctypes.CDLL("libcrypt.so.1")
+          libcrypt.crypt.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+          libcrypt.crypt.restype = ctypes.c_char_p
+          computed_new = libcrypt.crypt(new_pw.encode("utf-8"), shadow_hash.encode("utf-8"))
+          assert computed_new == shadow_hash.encode("utf-8"), "Linux /etc/shadow rejected rotated password"
+          computed_old = libcrypt.crypt(old_pw.encode("utf-8"), shadow_hash.encode("utf-8"))
+          assert computed_old != shadow_hash.encode("utf-8"), "Linux /etc/shadow still accepted previous password"
+          print("Verified /etc/shadow accepts rotated password and rejects previous password.")
+          ' "$LAPS_ADMIN_USER"
+
+          # Verify /var/lib/golaps/last_rotation.txt exists, has hardened ownership/mode, and valid ISO-8601 UTC timestamp.
+          MARKER="/var/lib/golaps/last_rotation.txt"
+          test -f "$MARKER"
+          test ! -L "$MARKER"
+          [ "$(stat -c '%u:%g %a' /var/lib/golaps)" = "0:0 755" ]
+          [ "$(stat -c '%u:%g %a' "$MARKER")" = "0:0 644" ]
+          python3 - "$MARKER" <<'PY'
+          import datetime, sys
+          with open(sys.argv[1], "r", encoding="utf-8") as handle:
+              ts = handle.read().strip()
+          parsed = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+          assert parsed.tzinfo is not None, "timestamp missing timezone"
+          print(f"Verified rotation marker timestamp: {ts}")
+          PY
+
+          # Negative security test: make /usr/local/bin/golaps group-writable and verify fail-closed refusal.
+          sudo chmod 0775 /usr/local/bin/golaps
+          set +e
+          sudo env \
+            LAPS_ADMIN_USER="$LAPS_ADMIN_USER" \
+            LAPS_VAULT_TYPE="$LAPS_VAULT_TYPE" \
+            LAPS_VAULT_ID="$LAPS_VAULT_ID" \
+            VAULT_ADDR="$VAULT_ADDR" \
+            LAPS_VAULT_PATH="$LAPS_VAULT_PATH" \
+            bash "$RENDERED_SCRIPT"
+          NEG_EXIT=$?
+          set -e
+          sudo chmod 0755 /usr/local/bin/golaps
+          if [ "$NEG_EXIT" -eq 0 ]; then
+            echo "::error::Expected run-golaps-linux.sh to fail closed on writable binary"
+            exit 1
+          fi
+          echo "Negative trust check passed (script refused writable binary with exit ${NEG_EXIT})."
+
+          # Negative placeholder check: verify unedited example-admin placeholder is refused fail-closed.
+          set +e
+          sudo env LAPS_ADMIN_USER="example-admin" LAPS_VAULT_TYPE="hashicorp" LAPS_VAULT_ID="laps" \
+            VAULT_ADDR="http://127.0.0.1:18200" LAPS_VAULT_PATH="secret/data/laps" \
+            bash "$RENDERED_SCRIPT"
+          PLACEHOLDER_EXIT=$?
+          set -e
+          if [ "$PLACEHOLDER_EXIT" -eq 0 ]; then
+            echo "::error::Expected run-golaps-linux.sh to fail closed on placeholder LAPS_ADMIN_USER=example-admin"
+            exit 1
+          fi
+          echo "Negative placeholder check passed (script refused example-admin with exit ${PLACEHOLDER_EXIT})."
+
+      - name: Verify /var/run/golaps.lock flock blocks concurrent run with exit 75 and preserves last_rotation.txt
+        run: |
+          set -euo pipefail
+          MARKER="/var/lib/golaps/last_rotation.txt"
+          SENTINEL_TS="2000-01-01T00:00:00Z"
+          echo "$SENTINEL_TS" | sudo tee "$MARKER" > /dev/null
+          sudo chmod 0644 "$MARKER"
+
+          set +e
+          OUT=$(sudo flock -x /var/run/golaps.lock bash -c '
+            printf "%s\n\n" "golaps-e2e-token" | /usr/local/bin/golaps --secrets-from-stdin 2>&1
+          ')
+          LOCK_EXIT=$?
+          set -e
+          echo "$OUT"
+          if [ "$LOCK_EXIT" -ne 75 ]; then
+            echo "::error::Expected exit code 75 (EX_TEMPFAIL) when lock is held, got ${LOCK_EXIT}"
+            exit 1
+          fi
+          if ! grep -q "Another GoLAPS run holds" <<< "$OUT"; then
+            echo "::error::Expected lock-held log message from concurrent golaps invocation"
+            exit 1
+          fi
+
+          RENDERED_LOCK_SCRIPT=$(mktemp /tmp/golaps-lock-test.XXXXXX)
+          trap 'rm -f "$RENDERED_LOCK_SCRIPT"' EXIT
+          python3 - deploy/fleet/scripts/run-golaps-linux.sh "$RENDERED_LOCK_SCRIPT" <<'PY'
+          import sys
+          src_path, dst_path = sys.argv[1], sys.argv[2]
+          with open(src_path, "r", encoding="utf-8") as handle:
+              data = handle.read()
+          data = data.replace("$FLEET_SECRET_GOLAPS_VAULT_TOKEN", "golaps-e2e-token")
+          data = data.replace("$FLEET_SECRET_GOLAPS_LEGACY_PASS", "")
+          with open(dst_path, "w", encoding="utf-8") as handle:
+              handle.write(data)
+          PY
+          chmod 0700 "$RENDERED_LOCK_SCRIPT"
+
+          WRAPPER_OUT=$(sudo env LAPS_ADMIN_USER="golaps-admin" LAPS_VAULT_TYPE="hashicorp" LAPS_VAULT_ID="laps" \
+            flock -x /var/run/golaps.lock bash "$RENDERED_LOCK_SCRIPT" 2>&1)
+          echo "$WRAPPER_OUT"
+          if ! grep -q "GoLAPS skipped rotation (exit 75); leaving last_rotation.txt unchanged." <<< "$WRAPPER_OUT"; then
+            echo "::error::Expected skip message from run-golaps-linux.sh when lock is held"
+            exit 1
+          fi
+          if [ "$(cat "$MARKER")" != "$SENTINEL_TS" ]; then
+            echo "::error::Expected $MARKER to remain unchanged ($SENTINEL_TS), got $(cat "$MARKER")"
+            exit 1
+          fi
+          echo "flock concurrency test passed (exit 75 and last_rotation.txt unchanged)."

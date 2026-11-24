@@ -6,8 +6,10 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -65,5 +67,8 @@ func TestRunLockRefusesASymlink(t *testing.T) {
 	if err == nil {
 		f.Close()
 		t.Fatalf("acquire followed a symlink (held=%v)", held)
+	}
+	if !errors.Is(err, syscall.ELOOP) {
+		t.Fatalf("acquire on symlink returned %v, want ELOOP", err)
 	}
 }

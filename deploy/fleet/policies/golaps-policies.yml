@@ -59,3 +59,33 @@
       AND f.mtime > (strftime('%s', 'now') - 2592000);
   run_script:
     path: ../scripts/run-golaps-windows.ps1
+
+- name: GoLAPS - Linux binary installed
+  platform: linux
+  description: Verify that the GoLAPS binary is installed at /usr/local/bin/golaps.
+  resolution: Install the GoLAPS Linux package from Fleet software packages.
+  critical: false
+  query: >-
+    SELECT 1 FROM file
+    WHERE path = '/usr/local/bin/golaps' AND type = 'regular';
+
+- name: GoLAPS - Linux managed admin exists in sudo or wheel and rotated recently
+  platform: linux
+  description: >-
+    Verify that the managed administrator exists, belongs to sudo or wheel,
+    and rotated within the last 30 days.
+  resolution: >-
+    Fleet runs run-golaps-linux.sh automatically on Fleet Premium, or run it manually
+    from the host Scripts tab.
+  critical: true
+  query: >-
+    SELECT 1
+    FROM users u
+    JOIN user_groups ug ON ug.uid = u.uid
+    JOIN groups g ON g.gid = ug.gid
+    JOIN file f ON f.path = '/var/lib/golaps/last_rotation.txt'
+    WHERE u.username = 'example-admin'
+      AND g.groupname IN ('sudo', 'wheel')
+      AND f.mtime > (strftime('%s', 'now') - 2592000);
+  run_script:
+    path: ../scripts/run-golaps-linux.sh
