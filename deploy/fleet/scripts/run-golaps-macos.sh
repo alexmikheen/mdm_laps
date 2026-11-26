@@ -29,7 +29,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Verify that the binary and every parent directory are root-owned and not group/other writable.
+# Check that the binary and every parent directory are root-owned and not group/other writable.
 verify_trusted_binary() {
     local target="$1"
     if [ -L "$target" ] || [ ! -f "$target" ]; then
@@ -80,7 +80,7 @@ if grep -qi "Battery Power" <<< "$BATT_INFO" || grep -qi "Discharging" <<< "$BAT
     fi
 fi
 
-# Confirm binary integrity before running GoLAPS as root.
+# Check binary integrity before running GoLAPS as root.
 if ! verify_trusted_binary "$LAPS_BINARY"; then
     echo "[ERROR] Refusing to run untrusted binary $LAPS_BINARY."
     exit 1

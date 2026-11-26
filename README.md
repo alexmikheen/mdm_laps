@@ -5,7 +5,7 @@
 # GoLAPS
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go&logoColor=white)](go.mod)
+[![Go Version](https://img.shields.io/badge/Go-1.27+-00ADD8?logo=go&logoColor=white)](go.mod)
 [![Platforms](https://img.shields.io/badge/Platforms-macOS%20arm64%20%7C%20Windows%20amd64%20%7C%20Linux%20amd64%2Farm64-lightgrey)]()
 
 GoLAPS rotates managed local administrator passwords on **macOS (Apple Silicon)**, **Windows (x64)**, and **Linux (amd64 and arm64)** fleets. It stores the new credential in your vault provider before it changes the device account.

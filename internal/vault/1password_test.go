@@ -220,3 +220,20 @@ func TestIsNetworkErrorMatchesObservedFailures(t *testing.T) {
 		t.Fatalf("nil must not classify as network")
 	}
 }
+
+func TestApplyRotatedFieldsKeepsBridgePassword(t *testing.T) {
+	fields := []onepassword.ItemField{
+		{ID: "field_password", Value: "old"},
+		{ID: PendingPasswordFieldID, Value: "staged"},
+		{ID: BridgePasswordFieldID, Value: "bridge-pw"},
+	}
+	fields = applyRotatedFields(fields, &Credentials{}, "localadmin", "staged", "ENABLED", "host")
+	var bridge, pending bool
+	for _, f := range fields {
+		bridge = bridge || f.ID == BridgePasswordFieldID && f.Value == "bridge-pw"
+		pending = pending || f.ID == PendingPasswordFieldID
+	}
+	if !bridge || pending {
+		t.Fatalf("bridge kept=%v pending removed=%v; fields=%+v", bridge, !pending, fields)
+	}
+}

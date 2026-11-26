@@ -42,3 +42,7 @@ func disableCoreDumps() error {
 func openLogNoFollow(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 }
+
+func readLogNoFollow(path string) ([]byte, error) {
+	return os.ReadFile(path)
+}

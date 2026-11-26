@@ -82,21 +82,7 @@ func localUserRecord(user: String) throws -> ODRecord? {
 }
 
 // verifyPasswordNative checks a login password through OpenDirectory.
-func verifyPasswordNative(user: String, pass: String) -> Bool {
-    do {
-        guard let record = try localUserRecord(user: user) else {
-            fputs("[SWIFT] User \(user) not found in OpenDirectory\n", stderr)
-            return false
-        }
-        try record.verifyPassword(pass)
-        return true
-    } catch {
-        fputs("[SWIFT] Password verification failed for \(user): \(error)\n", stderr)
-        return false
-    }
-}
-
-// Exit codes for change_password; Go mirrors these raw values in macos.go.
+// ChangeOutcome is the exit code of change_password and verify_password.
 enum ChangeOutcome: Int32 {
     case ok = 0
     case odError = 1
@@ -117,12 +103,41 @@ enum ChangeOutcome: Int32 {
     }
 }
 
+let odErrorInvalidCredentials = 5000
 let odErrorAccountTemporarilyLocked = 5304
 let odErrorAccountLocked = 5305
 // OpenDirectory 5402-5407: password policy rejected the new password.
 let odErrorPolicyViolations: ClosedRange<Int> = 5402...5407
 // OpenDirectory 5200-5205: transient server or transport errors.
 let odErrorServerTransport: ClosedRange<Int> = 5200...5205
+
+func verifyPasswordNative(user: String, pass: String) -> ChangeOutcome {
+    let record: ODRecord?
+    do {
+        record = try localUserRecord(user: user)
+    } catch {
+        fputs("[SWIFT] OpenDirectory Error: \(error)\n", stderr)
+        return .odError
+    }
+    guard let record else {
+        fputs("[SWIFT] User \(user) not found in OpenDirectory\n", stderr)
+        return .odError
+    }
+    do {
+        try record.verifyPassword(pass)
+        return .ok
+    } catch {
+        let code = (error as NSError).code
+        let outcome: ChangeOutcome
+        switch code {
+        case odErrorInvalidCredentials: outcome = .authFailed
+        case odErrorAccountLocked, odErrorAccountTemporarilyLocked: outcome = .locked
+        default: outcome = .odError
+        }
+        fputs("[SWIFT] Password verification failed for \(user) (OpenDirectory code \(code), reporting \(outcome.label)): \(error)\n", stderr)
+        return outcome
+    }
+}
 
 // changePasswordNative rotates the password and only falls back to sysadminctl when Go sets allowAdminReset.
 func changePasswordNative(user: String, oldPass: String?, newPass: String, allowAdminReset: Bool) -> ChangeOutcome {
@@ -147,7 +162,7 @@ func changePasswordNative(user: String, oldPass: String?, newPass: String, allow
             let code = (error as NSError).code
             let outcome: ChangeOutcome
             switch code {
-            case odErrorAccountTemporarilyLocked, odErrorAccountLocked: outcome = .locked
+            case odErrorAccountLocked, odErrorAccountTemporarilyLocked: outcome = .locked
             case odErrorPolicyViolations: outcome = .policyRejected
             case odErrorServerTransport: outcome = .odError
             case 5000, 5101, 5300...5303, 5400, 5401: outcome = .authFailed
@@ -204,7 +219,7 @@ func grantSecureTokenSecure(targetUser: String, targetPass: String, adminUser: S
     } catch { return false }
 }
 
-// sysadminctl can exit 0 even when opendirectoryd refuses the grant, so verify the token state explicitly.
+// sysadminctl can exit 0 even when opendirectoryd refuses the grant, so check the token state explicitly.
 func secureTokenIsEnabled(user: String) -> Bool {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/sbin/sysadminctl")
@@ -254,7 +269,7 @@ if payload.action == "change_password" {
     )
     exit(outcome.rawValue)
 } else if payload.action == "verify_password" {
-    exit(verifyPasswordNative(user: payload.targetUser, pass: payload.targetPass) ? 0 : 1)
+    exit(verifyPasswordNative(user: payload.targetUser, pass: payload.targetPass).rawValue)
 } else if payload.action == "grant_token" {
     guard let adminUser = payload.adminUser, let adminPass = payload.adminPass else {
         fputs("[SWIFT] Missing admin credentials for token grant.\n", stderr)

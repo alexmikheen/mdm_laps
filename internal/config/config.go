@@ -25,7 +25,7 @@ const (
 	// secretsFromStdinFlag tells Load to read the vault token and the legacy password from stdin so neither secret appears in any process environment block.
 	secretsFromStdinFlag = "--secrets-from-stdin"
 
-	// Absolute Apple tool paths and fixed PATH for root child processes.
+	// Absolute Apple tool paths and a safe PATH for root child processes.
 	defaultsBin = "/usr/bin/defaults"
 	securityBin = "/usr/bin/security"
 	toolPath    = "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
@@ -189,7 +189,7 @@ func clampPassLength(n int) int {
 	return clamped
 }
 
-// readSecrets reads the vault token and legacy password from stdin when --secrets-from-stdin is passed, or from environment variables / System Keychain otherwise.
+// readSecrets reads the vault token and legacy password from stdin with --secrets-from-stdin, or from environment variables and System Keychain.
 func readSecrets(ctx context.Context, src sources, vaultType string) (token, legacyPass string, err error) {
 	if hasFlag(src.args, secretsFromStdinFlag) {
 		r := bufio.NewReader(src.stdin)

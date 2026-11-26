@@ -29,7 +29,7 @@ func newHashiCorpConfig(address string) (*api.Config, error) {
 	}
 	config.Address = address
 
-	// Enforce TLS verification even if VAULT_SKIP_VERIFY is set in the environment.
+	// Enforce TLS verification even when the environment sets VAULT_SKIP_VERIFY.
 	if config.HttpClient == nil {
 		return nil, errors.New("vault HTTP client is not initialized")
 	}
@@ -63,7 +63,7 @@ func NewHashiCorpClient(address, token, path string) (*HashiCorpClient, error) {
 
 	client.SetToken(token)
 
-	// Verify connection
+	// Check connection
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -188,7 +188,7 @@ func (hc *HashiCorpClient) StagePendingPassword(ctx context.Context, creds *Cred
 	return nil
 }
 
-// ClearPendingPassword removes the staged value after a policy-rejected rotation.
+// ClearPendingPassword deletes the staged value after a policy-rejected rotation.
 func (hc *HashiCorpClient) ClearPendingPassword(ctx context.Context, creds *Credentials, vaultID string) error {
 	if creds.ItemID == "" {
 		return nil
@@ -284,7 +284,7 @@ func (hc *HashiCorpClient) UpsertCredentials(ctx context.Context, creds *Credent
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	// Read-modify-write so bridge_password and existing legacy_* fields survive until explicitly cleared.
+	// Read and update the existing secret so bridge_password and legacy_* fields survive until explicitly cleared.
 	data, err := hc.readData(ctx, deviceID)
 	if err != nil {
 		return err

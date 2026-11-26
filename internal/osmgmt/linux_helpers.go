@@ -293,7 +293,7 @@ func parseLoginDefsUIDMin(content string) int {
 	return uidMin
 }
 
-// validateManagedLocalAccount verifies that an existing local user is safe for GoLAPS to manage.
+// validateManagedLocalAccount checks that an existing local user is safe for GoLAPS to manage.
 func validateManagedLocalAccount(entry linuxPasswdEntry, uidMin int) error {
 	if entry.UID == 0 {
 		return fmt.Errorf("refusing to manage uid 0 account %q", entry.Name)
@@ -354,7 +354,7 @@ func checkTrustedLinuxEntry(entryPath string, fs linuxToolFS, wantDir bool) erro
 	return nil
 }
 
-// resolveLinuxTool locates an executable binary in system directories and verifies root ownership and permissions after resolving symlinks.
+// resolveLinuxTool locates an executable binary in system directories and checks root ownership and permissions after resolving symlinks.
 func resolveLinuxTool(name string, fs linuxToolFS) (string, error) {
 	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
 		return "", fmt.Errorf("invalid tool name %q", name)
@@ -460,7 +460,7 @@ func sudoRuleGrantsAll(line string) bool {
 	return false
 }
 
-// verifySudoEscalation verifies that sudo -l -U output grants (ALL) root escalation without targetpw blocking it.
+// verifySudoEscalation checks that sudo -l -U output grants (ALL) root escalation without targetpw blocking it.
 func verifySudoEscalation(output string) error {
 	var hasAllRule bool
 	var targetpwBlocked bool

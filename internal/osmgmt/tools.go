@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// Every Apple tool is invoked by its absolute path with a fixed system PATH so an inherited PATH or DYLD variable never reaches a root child process.
+// Run each Apple tool by its absolute path with a safe PATH so child processes inherit no user environment.
 const (
 	toolSysadminctl  = "/usr/sbin/sysadminctl"
 	toolDscl         = "/usr/bin/dscl"
@@ -69,7 +69,7 @@ func commandContext(ctx context.Context, name string, args ...string) *exec.Cmd 
 
 var errNoFileCheck = errors.New("no file check is configured")
 
-// trustedBinary verifies that path and every parent directory up to "/" are root-owned, not symlinks, and not writable by group or other.
+// trustedBinary checks that path and every parent directory up to "/" are root-owned, not symlinks, and not writable by group or other.
 func (m *MacOSManager) trustedBinary(path string) error {
 	if m.lstat == nil {
 		return fmt.Errorf("%s: %w", path, errNoFileCheck)

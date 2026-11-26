@@ -56,7 +56,7 @@ func NewAWSClient(region, profile string) (*AWSClient, error) {
 }
 
 // readData returns the device's current secret map, or an empty map when the secret does not exist yet.
-// Network and IAM permission errors are returned so the orchestrator aborts instead of rotating without a working escrow.
+// It returns network and IAM permission errors so the orchestrator aborts instead of rotating without a working escrow.
 func (awsClient *AWSClient) readData(ctx context.Context, secretName string) (map[string]string, error) {
 	result, err := awsClient.client.GetSecretValue(ctx, &secretsmanager.GetSecretValueInput{
 		SecretId: aws.String(secretName),
@@ -174,7 +174,7 @@ func (awsClient *AWSClient) StagePendingPassword(ctx context.Context, creds *Cre
 	return nil
 }
 
-// ClearPendingPassword removes the staged value after a policy-rejected rotation.
+// ClearPendingPassword deletes the staged value after a policy-rejected rotation.
 func (awsClient *AWSClient) ClearPendingPassword(ctx context.Context, creds *Credentials, vaultID string) error {
 	if creds.ItemID == "" {
 		return nil
@@ -270,7 +270,7 @@ func (awsClient *AWSClient) UpsertCredentials(ctx context.Context, creds *Creden
 	defer cancel()
 
 	secretName := fmt.Sprintf("laps/%s", deviceID)
-	// Read-modify-write so bridge_password and existing legacy_* fields survive until explicitly cleared.
+	// Read and update the existing secret so bridge_password and legacy_* fields survive until explicitly cleared.
 	secretData, err := awsClient.readData(ctx, secretName)
 	if err != nil {
 		return err

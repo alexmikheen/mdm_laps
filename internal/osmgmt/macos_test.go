@@ -190,6 +190,18 @@ func TestChangeOutcomeValuesMatchSwiftHelper(t *testing.T) {
 	}
 }
 
+func TestSwiftProgramsIgnoreSIGPIPE(t *testing.T) {
+	for _, file := range []string{"mac_helper.swift", "auth_window.swift"} {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("cannot read %s: %v", file, err)
+		}
+		if !regexp.MustCompile(`(?m)^signal\(SIGPIPE, SIG_IGN\)`).Match(src) {
+			t.Errorf("%s lost the top-level signal(SIGPIPE, SIG_IGN) call", file)
+		}
+	}
+}
+
 func TestChangeOutcomeString(t *testing.T) {
 	for outcome, want := range map[changeOutcome]string{
 		changeOK:           "ok",

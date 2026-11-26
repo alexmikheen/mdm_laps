@@ -65,11 +65,7 @@ func effectiveRunBudget(delayEnv string) time.Duration {
 }
 
 func tailCapLog(path string) {
-	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 {
-		return
-	}
-	data, err := os.ReadFile(path)
+	data, err := readLogNoFollow(path)
 	if err != nil {
 		return
 	}
@@ -222,7 +218,7 @@ func main() {
 		fail("[ERROR] Vault Init Failed: %v", err)
 	}
 
-	// Scrub AWS runtime credentials once the AWS SDK client has initialized so no child process inherits them.
+	// Scrub AWS runtime credentials once the AWS SDK client initializes so no child process inherits them.
 	os.Unsetenv("AWS_SECRET_ACCESS_KEY")
 	os.Unsetenv("AWS_SESSION_TOKEN")
 

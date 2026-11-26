@@ -7,6 +7,7 @@ package main
 
 import (
 	"errors"
+	"io"
 	"os"
 	"syscall"
 )
@@ -31,4 +32,14 @@ func acquireRunLock(path string) (f *os.File, held bool, err error) {
 
 func openLogNoFollow(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
+}
+
+// Open with O_NOFOLLOW instead of an lstat because a separate read leaves a window between check and open.
+func readLogNoFollow(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
 }

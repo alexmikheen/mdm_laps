@@ -38,6 +38,8 @@ const (
 	windowFailedRedAfter    = 2
 	wrongPasswordPause      = 10 * time.Minute
 
+	socketLogLimit = 3
+
 	// Poll wall-clock time during pauses because Go monotonic timers freeze while macOS sleeps.
 	pauseTick = 5 * time.Second
 
@@ -181,7 +183,6 @@ func parseDialogEvent(line string) (dialogEvent, error) {
 	}
 	switch {
 	case raw.Event == "password" || raw.Password != "":
-		// The password comes through the socket only. A password on the output is a window that is not ours, or an old one.
 		return dialogEvent{}, errors.New("the window sent a password on its output")
 	case raw.Event == "later" && raw.Password == "":
 		return dialogEvent{kind: eventLater}, nil
@@ -217,24 +218,61 @@ func (s promptState) deferralsLeft(now time.Time) int {
 	return maxDeferrals - s.Deferrals
 }
 
+// One record for each console user, so a shared Mac never hands the spent budget of one person to the next.
+type promptRecords struct {
+	Records map[string]promptState `json:"records"`
+}
+
+func readFileNoFollow(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+// A record at the top level of the file comes from an older build and reads as the record of its user.
+func (m *MacOSManager) readPromptRecords() (map[string]promptState, error) {
+	records := map[string]promptState{}
+	raw, err := readFileNoFollow(m.promptStatePath)
+	if os.IsNotExist(err) {
+		return records, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var file struct {
+		promptRecords
+		promptState
+	}
+	if err := json.Unmarshal(raw, &file); err != nil {
+		return nil, err
+	}
+	if file.Records != nil {
+		return file.Records, nil
+	}
+	if file.User != "" {
+		records[file.User] = file.promptState
+	}
+	return records, nil
+}
+
 func (m *MacOSManager) loadPromptState(user string) promptState {
 	fresh := promptState{User: user, FirstPrompt: m.now().UTC()}
 	if m.promptStatePath == "" {
 		return fresh
 	}
-	raw, err := os.ReadFile(m.promptStatePath)
+	records, err := m.readPromptRecords()
 	if err != nil {
-		return fresh
-	}
-	var state promptState
-	if err := json.Unmarshal(raw, &state); err != nil {
 		log.Printf("[WARNING] The deferral record %s is not readable (%v). Starting a new budget for %s.\n", m.promptStatePath, err, user)
 		return fresh
 	}
-	if state.User != user {
-		// A shared Mac must not hand the spent budget of one person to the next one.
+	state, found := records[user]
+	if !found {
 		return fresh
 	}
+	state.User = user
 	if state.FirstPrompt.IsZero() || state.FirstPrompt.After(m.now()) || state.Deferrals < 0 || state.Unanswered < 0 || state.WrongPasswordRuns < 0 || state.WindowFailedRuns < 0 {
 		log.Printf("[WARNING] The deferral record of %s is not plausible (first prompt %s, %d postponements). Starting a new budget.\n", user, state.FirstPrompt.Format(time.RFC3339), state.Deferrals)
 		return fresh
@@ -246,18 +284,43 @@ func (m *MacOSManager) savePromptState(state promptState) {
 	if m.promptStatePath == "" {
 		return
 	}
-	raw, err := json.Marshal(state)
+	records, err := m.readPromptRecords()
+	if err != nil {
+		log.Printf("[WARNING] Could not read the existing deferral record %s before saving (%v); starting a fresh record map.\n", m.promptStatePath, err)
+		records = map[string]promptState{}
+	}
+	records[state.User] = state
+	raw, err := json.Marshal(promptRecords{Records: records})
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(m.promptStatePath), 0o700); err != nil {
+	dir := filepath.Dir(m.promptStatePath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		log.Printf("[WARNING] Could not create the directory of the deferral record: %v\n", err)
 		return
 	}
 	// Atomic write so an interrupted run preserves the previous state file.
-	tmp := m.promptStatePath + ".tmp"
-	if err := os.WriteFile(tmp, append(raw, '\n'), 0o600); err != nil {
+	tmpFile, err := os.CreateTemp(dir, "token_prompt.json.tmp.*")
+	if err != nil {
+		log.Printf("[WARNING] Could not create the temporary deferral record: %v\n", err)
+		return
+	}
+	tmp := tmpFile.Name()
+	if err := tmpFile.Chmod(0o600); err != nil {
+		log.Printf("[WARNING] Could not set the mode of the deferral record: %v\n", err)
+		tmpFile.Close()
+		os.Remove(tmp)
+		return
+	}
+	if _, err := tmpFile.Write(append(raw, '\n')); err != nil {
 		log.Printf("[WARNING] Could not write the deferral record: %v\n", err)
+		tmpFile.Close()
+		os.Remove(tmp)
+		return
+	}
+	if err := tmpFile.Close(); err != nil {
+		log.Printf("[WARNING] Could not close the deferral record: %v\n", err)
+		os.Remove(tmp)
 		return
 	}
 	if err := os.Rename(tmp, m.promptStatePath); err != nil {
@@ -361,45 +424,59 @@ func startPipeWindow(cmd *exec.Cmd, req dialogRequest, socketPath string, uid in
 
 func (w *pipeWindow) acceptPasswords() {
 	defer close(w.socketDone)
+	drops := map[string]int{}
+	defer func() {
+		for kind, count := range drops {
+			if count > socketLogLimit {
+				log.Printf("[WARNING] The password socket dropped %d connections of the kind %q in this window. Only the first %d have a log line.\n", count, kind, socketLogLimit)
+			}
+		}
+	}()
 	for {
 		conn, err := w.socket.AcceptUnix()
 		if err != nil {
 			return // the listener is closed
 		}
-		password, ok := w.readPassword(conn)
+		password, drop := w.readPassword(conn)
 		conn.Close()
-		if ok {
+		if drop.kind == "" {
 			w.deliver(windowMessage{event: dialogEvent{kind: eventPassword, password: password}})
+			continue
+		}
+		drops[drop.kind]++
+		if drops[drop.kind] <= socketLogLimit {
+			log.Print(drop.line)
 		}
 	}
 }
 
-func (w *pipeWindow) readPassword(conn *net.UnixConn) (string, bool) {
+type socketDrop struct {
+	kind string
+	line string
+}
+
+func (w *pipeWindow) readPassword(conn *net.UnixConn) (string, socketDrop) {
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if uid, err := peerUID(conn); err != nil || uid != w.peerUID {
-		log.Printf("[WARNING] Dropped a connection to the password socket that is not from the console user (uid %d, err %v).\n", uid, err)
-		return "", false
+		return "", socketDrop{"other-user", fmt.Sprintf("[WARNING] Dropped a connection to the password socket that is not from the console user (uid %d, err %v).\n", uid, err)}
 	}
 	line, err := bufio.NewReader(io.LimitReader(conn, maxWindowLine+1)).ReadString('\n')
+	// Check the length before err, because a line that is too long also ends the read with EOF.
+	if len(line) > maxWindowLine {
+		return "", socketDrop{"too-long", fmt.Sprintf("[WARNING] A line on the password socket is longer than %d bytes. It is dropped.\n", maxWindowLine)}
+	}
 	if err != nil {
 		// PasswordChannel.reachable opens and closes an empty connection at startup.
 		if errors.Is(err, io.EOF) && line == "" {
-			log.Printf("[INFO] The window checked that the password socket is reachable.\n")
-			return "", false
+			return "", socketDrop{"probe", "[INFO] The window checked that the password socket is reachable.\n"}
 		}
-		log.Printf("[WARNING] A connection to the password socket ended before a full line arrived (%v). The window must send the password again.\n", err)
-		return "", false
-	}
-	if len(line) > maxWindowLine {
-		log.Printf("[WARNING] A line on the password socket is longer than %d bytes. It is dropped.\n", maxWindowLine)
-		return "", false
+		return "", socketDrop{"incomplete", fmt.Sprintf("[WARNING] A connection to the password socket ended before a full line arrived (%v). The window must send the password again.\n", err)}
 	}
 	password := strings.TrimSuffix(line, "\n")
 	if password == "" {
-		log.Printf("[WARNING] The password socket received an empty line. It is dropped.\n")
-		return "", false
+		return "", socketDrop{"empty-line", "[WARNING] The password socket received an empty line. It is dropped.\n"}
 	}
-	return password, true
+	return password, socketDrop{}
 }
 
 // peerUID returns the effective uid of the process at the other end of a unix socket.
@@ -559,7 +636,7 @@ func (m *MacOSManager) pauseFits(ctx context.Context, pause time.Duration) bool 
 	return deadline.Sub(m.now())-pause-windowAnswerGrace >= minPromptTime
 }
 
-// askPassword runs the native auth window flow, verifies the password, and invokes use to grant the Secure Token.
+// askPassword runs the native auth window flow, checks the password, and invokes use to grant the Secure Token.
 func (m *MacOSManager) askPassword(ctx context.Context, uid, user string, needAdmin bool, use func(ctx context.Context, password string) error) (outcome passwordOutcome, tally promptTally) {
 	word := ""
 	defer func() { logPromptReport(promptReport(outcome, word)) }()
@@ -584,8 +661,8 @@ func (m *MacOSManager) askPassword(ctx context.Context, uid, user string, needAd
 	}
 	deferralsLeft := state.deferralsLeft(m.now())
 	blockScreen := state.Unanswered >= blockScreenAfter
-	// Lock the field for a pause instead of closing once deferrals end and the wrong-password streak reaches wrongPasswordPauseAfter.
 	pauseInsteadOfClose := (deferralsLeft == 0 || blockScreen) && state.WrongPasswordRuns >= wrongPasswordPauseAfter
+	paused := false
 	window, err := m.openWindow(ctx, uid, user, dialogRequest{
 		Attempt:        attempt,
 		MaxAttempts:    maxPasswordAttempts,
@@ -606,6 +683,9 @@ func (m *MacOSManager) askPassword(ctx context.Context, uid, user string, needAd
 	cancelStart()
 	if err != nil || first.kind != eventShown {
 		log.Printf("[PROMPT FAILED: window] The window did not appear for %s (%v). No prompt in this run.\n", user, err)
+		windowFailed = true
+		state.WindowFailedRuns++
+		m.savePromptState(state)
 		return passwordUnavailable, counts()
 	}
 
@@ -689,20 +769,18 @@ func (m *MacOSManager) askPassword(ctx context.Context, uid, user string, needAd
 				if err := m.openApp(ctx, uid, user, abrAppName); err != nil {
 					log.Printf("[WARNING] Admin By Request could not be raised for %s: %v. The user can open it from the menu bar.\n", user, err)
 				}
-				// The window starts its time limit again at this click. Do the same here.
 				waitStart = time.Now()
 			case eventLater:
 				return later(), false
 			case eventTimeout:
 				return timeout(), false
 			default:
-				// A password in the admin step cannot be used: the grant needs the admin rights first. The window sends none in this step.
 				return broken(errors.New("the window sent a password before the admin rights were there")), false
 			}
 		}
 	}
 
-	// Lock the password field for wrongPasswordPause by wall clock, then verify admin rights again.
+	// Lock the password field for wrongPasswordPause by wall clock, then check admin rights again.
 	pause := func() (outcome passwordOutcome, ok bool) {
 		log.Printf("[WRONG PASSWORD PAUSE] %s entered a wrong password in each of %d attempts. The password field is locked for %s and the screen stays blocked.\n", user, maxPasswordAttempts, m.wrongPasswordPause)
 		if err := window.pause(int(m.wrongPasswordPause / time.Second)); err != nil {
@@ -732,9 +810,12 @@ func (m *MacOSManager) askPassword(ctx context.Context, uid, user string, needAd
 			case eventTimeout:
 				return timeout(), false
 			case eventPassword:
-				// The window opens its field only on the view password, which comes after this loop. If a password arrives early while paused, re-send the pause command so the window stays synchronized.
 				log.Printf("[WARNING] %s typed a password during the pause. It is not checked. The field is locked again for the rest of the pause.\n", user)
-				if err := window.pause(int(pauseUntil.Sub(m.now()) / time.Second)); err != nil {
+				leftSecs := int((pauseUntil.Sub(m.now()) + time.Second - 1) / time.Second)
+				if leftSecs < 1 {
+					leftSecs = 1
+				}
+				if err := window.pause(leftSecs); err != nil {
 					return broken(err), false
 				}
 			}
@@ -767,7 +848,6 @@ func (m *MacOSManager) askPassword(ctx context.Context, uid, user string, needAd
 		}
 	}
 
-	afterPause := false
 	for attempt <= maxPasswordAttempts {
 		waitCtx, cancel := context.WithTimeout(ctx, limit+windowAnswerGrace)
 		event, err := window.next(waitCtx)
@@ -794,8 +874,8 @@ func (m *MacOSManager) askPassword(ctx context.Context, uid, user string, needAd
 			return timeout(), counts()
 		}
 
-		if afterPause && !m.inAdminGroup(ctx, user) {
-			log.Printf("[INFO] %s lost the administrator session after the pause; asking for Admin By Request again before the password is checked.\n", user)
+		if !m.inAdminGroup(ctx, user) {
+			log.Printf("[INFO] %s lost the administrator session; asking for Admin By Request again before the password is checked.\n", user)
 			if err := window.show(viewAdmin); err != nil {
 				return broken(err), counts()
 			}
@@ -812,14 +892,15 @@ func (m *MacOSManager) askPassword(ctx context.Context, uid, user string, needAd
 			log.Printf("[WARNING] Incorrect password entered in GUI (Attempt %d).\n", attempt)
 			attempt++
 			if attempt > maxPasswordAttempts {
-				if !pauseInsteadOfClose || !m.pauseFits(ctx, m.wrongPasswordPause) {
+				// One pause per run caps the failed logins of the console user at ten.
+				if !pauseInsteadOfClose || paused || !m.pauseFits(ctx, m.wrongPasswordPause) {
 					break
 				}
+				paused = true
 				if outcome, ok := pause(); !ok {
 					return outcome, counts()
 				}
 				attempt = 1
-				afterPause = true
 				continue
 			}
 			if err := window.wrong(attempt); err != nil {
@@ -850,7 +931,6 @@ func (m *MacOSManager) askPassword(ctx context.Context, uid, user string, needAd
 			return passwordGrantFailed, counts()
 		}
 		log.Println("[SUCCESS] GUI Token Grant Successful!")
-		// The grant worked, so both streaks end with the record.
 		state.WrongPasswordRuns = 0
 		state.WindowFailedRuns = 0
 		m.clearPromptState()
@@ -858,7 +938,6 @@ func (m *MacOSManager) askPassword(ctx context.Context, uid, user string, needAd
 		return passwordOK, counts()
 	}
 
-	// Each attempt was a wrong password. The window tells the user where to get help. The run counts against the streak.
 	m.countWrongPasswordRun(&state)
 	result(viewFailed)
 	return passwordFailed, counts()

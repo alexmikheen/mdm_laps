@@ -49,7 +49,7 @@ type Client interface {
 
 	UpsertCredentials(ctx context.Context, creds *Credentials, deviceID, hostname, vaultID, newLogin, newPassword, tokenStatus string) error
 
-	// ClearPendingPassword removes the staged password and restores any previous pending value.
+	// ClearPendingPassword deletes the staged password and restores any previous pending value.
 	ClearPendingPassword(ctx context.Context, creds *Credentials, vaultID string) error
 
 	// StageBridgePassword stores the bridge admin password before GoLAPS creates the bridge account.
