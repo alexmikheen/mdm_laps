@@ -23,7 +23,7 @@ import (
 
 const teamITChannelURL = ""
 
-// Use open -a to activate Admin By Request; its URL scheme does not open the elevation prompt.
+// Use open -a to activate Admin By Request because its URL scheme does not open the elevation prompt.
 const (
 	abrAppPath = "/Applications/Admin By Request.app"
 	abrAppName = "Admin By Request"
@@ -56,7 +56,7 @@ const (
 	changeAuthFailed   changeOutcome = 2
 	changeLocked       changeOutcome = 3
 	changeResetRefused changeOutcome = 4
-	// OD 5402-5407: device password policy rejected the new password; do not recreate.
+	// OD 5402-5407: device password policy rejected the new password. Do not recreate the account.
 	changePolicyRejected changeOutcome = 5
 )
 
@@ -161,14 +161,21 @@ func NewManager() Manager {
 // withReserve derives a sub-context capped at want while keeping reserve time for later steps.
 func withReserve(ctx context.Context, want, reserve time.Duration) (context.Context, context.CancelFunc) {
 	if deadline, ok := ctx.Deadline(); ok {
-		if available := time.Until(deadline) - reserve; available < want {
-			want = available
+		remaining := time.Until(deadline)
+		if available := remaining - reserve; available < want {
+			if available > 0 {
+				want = available
+			} else if remaining > 0 {
+				want = min(want, remaining)
+			} else {
+				want = 0
+			}
 		}
 	}
 	return context.WithTimeout(ctx, want)
 }
 
-// runSwiftHelper returns the helper exit code as a verdict; non-nil error means the helper failed to run.
+// runSwiftHelper returns the helper exit code as a verdict. A non-nil error means the helper failed to run.
 func (m *MacOSManager) runSwiftHelper(ctx context.Context, payload SwiftPayload) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
@@ -212,7 +219,7 @@ func (m *MacOSManager) callSwiftHelper(ctx context.Context, payload SwiftPayload
 
 var macSerialPattern = regexp.MustCompile(`^[A-Z0-9]{8,20}$`)
 
-// parseMacSerial validates the hardware serial so missing values never collide on one vault record.
+// parseMacSerial checks the hardware serial so missing values never collide on one vault record.
 func parseMacSerial(ioregOutput string) (string, error) {
 	re := regexp.MustCompile(`"IOPlatformSerialNumber" = "([^"]+)"`)
 	matches := re.FindStringSubmatch(ioregOutput)
@@ -486,7 +493,7 @@ func (m *MacOSManager) recreateAccount(ctx context.Context, user, newPassword st
 	if out, err := m.run.Run(ctx, "", toolSysadminctl, "-deleteUser", user); err != nil {
 		log.Printf("[WARNING] sysadminctl -deleteUser %s failed: %v | output: %s\n", user, err, strings.TrimSpace(string(out)))
 	}
-	// Never fall back to dscl -delete; it bypasses the last-admin guard and orphans the SEP identity.
+	// Never fall back to dscl -delete because it bypasses the last-admin guard and orphans the SEP identity.
 	stillThere, err := m.userAccountExists(ctx, user)
 	if err != nil {
 		return err
@@ -495,7 +502,7 @@ func (m *MacOSManager) recreateAccount(ctx context.Context, user, newPassword st
 		return m.createHiddenAdmin(ctx, user, "IT Admin", newPassword)
 	}
 
-	// Target is the last admin; create a temporary bridge admin so sysadminctl allows deletion.
+	// Target is the last admin. Create a temporary bridge admin so sysadminctl allows deletion.
 	log.Printf("[WARNING] %s survived deletion — it is likely the last admin (Admin By Request demotes the humans). Creating a temporary bridge admin...\n", user)
 	return m.withBridgeAdmin(ctx, user, func() error {
 		if out, err := m.run.Run(ctx, "", toolSysadminctl, "-deleteUser", user); err != nil {
@@ -630,7 +637,7 @@ func (m *MacOSManager) createAdminViaDscl(ctx context.Context, name, fullName, p
 // bridgeFullName distinguishes a GoLAPS-created bridge from a legacy laps-bridge account.
 const bridgeFullName = "IT Recovery Bridge"
 
-// withBridgeAdmin runs fn with laps-bridge present after escrowing its password and verifying another token holder exists.
+// withBridgeAdmin runs fn with laps-bridge present after escrowing its password and checking that another token holder exists.
 func (m *MacOSManager) withBridgeAdmin(ctx context.Context, targetUser string, fn func() error) error {
 	bridge := LegacyBridgeAdmin
 
@@ -643,11 +650,11 @@ func (m *MacOSManager) withBridgeAdmin(ctx context.Context, targetUser string, f
 		if m.escrowBridge == nil {
 			return fmt.Errorf("no escrow route for the bridge password; not creating %s", bridge)
 		}
-		bridgePass, err := password.Generate(0) // 0 means the default length of the generator. The password exists because -addUser requires one, and because the bridge may end up as a token holder.
+		bridgePass, err := password.Generate(0)
 		if err != nil {
 			return fmt.Errorf("could not generate a password for the bridge admin: %w", err)
 		}
-		escrowCtx, cancelEscrow := context.WithTimeout(ctx, 60*time.Second)
+		escrowCtx, cancelEscrow := withReserve(ctx, 60*time.Second, vaultWriteReserve)
 		err = m.escrowBridge(escrowCtx, bridgePass)
 		cancelEscrow()
 		if err != nil {
@@ -659,11 +666,18 @@ func (m *MacOSManager) withBridgeAdmin(ctx context.Context, targetUser string, f
 		}
 	} else {
 		log.Printf("[INFO] Reusing the existing %s account as the bridge admin.\n", bridge)
+		// Restore admin membership only when the account is a hidden LAPS bridge or hidden legacy admin.
 		if !m.inAdminGroup(ctx, bridge) {
-			log.Printf("[WARNING] Existing bridge %s is not in the admin group — re-adding before deleting %s.\n", bridge, targetUser)
-			if out, err := m.run.Run(ctx, "", toolDseditgroup, "-o", "edit", "-a", bridge, "-t", "user", "admin"); err != nil {
-				return fmt.Errorf("could not restore admin group membership for bridge %s: %w | %s", bridge, err, strings.TrimSpace(string(out)))
+			hidden := m.isHiddenAccount(ctx, bridge)
+			realName := m.realName(ctx, bridge)
+			if !hidden || !(m.isBridgeAccount(ctx) || realName == bridge) {
+				return fmt.Errorf("%s exists but is not a LAPS bridge or the legacy admin (hidden=%v, RealName %q); not promoting it to admin", bridge, hidden, realName)
 			}
+			log.Printf("[WARNING] The existing bridge admin %s is not in the admin group. The run adds it back before the heal.\n", bridge)
+			if out, err := m.run.Run(ctx, "", toolDseditgroup, "-o", "edit", "-a", bridge, "-t", "user", "admin"); err != nil {
+				return fmt.Errorf("could not add the existing bridge admin %s back to the admin group: %w | output: %s", bridge, err, strings.TrimSpace(string(out)))
+			}
+			log.Printf("[BRIDGE PROMOTED] %s was added back to the admin group for this heal.\n", bridge)
 		}
 	}
 
@@ -783,7 +797,7 @@ func bootstrapTokenEscrowed(output string) bool {
 	return strings.Contains(strings.ToLower(output), "escrowed to server: yes")
 }
 
-// candidatePassword picks one stored password for admin; GoLAPS bridges never use the legacy MDM password.
+// candidatePassword selects one stored password for admin. GoLAPS bridges never use the legacy MDM password.
 func (m *MacOSManager) candidatePassword(ctx context.Context, admin, targetUser string, availableCreds map[string]string) (pass, source string, ok bool) {
 	if pass, found := availableCreds[admin]; found && pass != "" {
 		return pass, "1Password specific", true
@@ -889,7 +903,13 @@ func (m *MacOSManager) VerifyPassword(ctx context.Context, user, pass string) (b
 	if err != nil {
 		return false, err
 	}
-	return code == 0, nil
+	switch changeOutcome(code) {
+	case changeOK:
+		return true, nil
+	case changeAuthFailed:
+		return false, nil
+	}
+	return false, fmt.Errorf("the helper could not tell whether the password is live (%s)", changeOutcome(code))
 }
 
 func (m *MacOSManager) verifyUserPassword(ctx context.Context, user, pass string) bool {
@@ -934,6 +954,28 @@ func countLocalCryptoUsers(output string) int {
 func (m *MacOSManager) isBridgeAccount(ctx context.Context) bool {
 	out, err := m.run.Run(ctx, "", toolDscl, ".", "-read", "/Users/"+LegacyBridgeAdmin, "RealName")
 	return err == nil && strings.Contains(string(out), bridgeFullName)
+}
+
+func (m *MacOSManager) dsclValue(ctx context.Context, user, attr string) (string, error) {
+	out, err := m.run.Run(ctx, "", toolDscl, ".", "-read", "/Users/"+user, attr)
+	if err != nil {
+		return "", fmt.Errorf("could not read %s of %s: %w | %s", attr, user, err, strings.TrimSpace(string(out)))
+	}
+	_, value, found := strings.Cut(string(out), attr+":")
+	if !found {
+		return "", fmt.Errorf("%s has no %s attribute", user, attr)
+	}
+	return strings.TrimSpace(value), nil
+}
+
+func (m *MacOSManager) realName(ctx context.Context, user string) string {
+	name, _ := m.dsclValue(ctx, user, "RealName")
+	return name
+}
+
+func (m *MacOSManager) isHiddenAccount(ctx context.Context, user string) bool {
+	value, err := m.dsclValue(ctx, user, "IsHidden")
+	return err == nil && value == "1"
 }
 
 func (m *MacOSManager) bridgeReport(ctx context.Context, availableCreds map[string]string, verdict string) string {
@@ -1050,7 +1092,7 @@ func (m *MacOSManager) promptUserForToken(ctx context.Context, targetUser, targe
 		return promptResult{outcome: passwordUnavailable, user: currentUser}
 	}
 
-	// opendirectoryd requires an admin credential for Secure Token grants; start on the AbR step for standard users.
+	// opendirectoryd requires an admin credential for Secure Token grants. Start on the AbR step for standard users.
 	needAdmin := !m.isAdminMember(ctx, currentUser)
 	if needAdmin {
 		if _, err := os.Stat(abrAppPath); err != nil {

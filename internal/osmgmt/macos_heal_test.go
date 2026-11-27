@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,11 +98,12 @@ func newTestManager(t *testing.T, f *fakeRunner) *MacOSManager {
 }
 
 type fakeOS struct {
-	exists map[string]bool
-	token  map[string]bool
+	exists   map[string]bool
+	token    map[string]bool
 	realName map[string]string
-	failed map[string]int
-	blocked map[string]bool
+	failed   map[string]int
+	blocked  map[string]bool
+	hidden   map[string]bool
 }
 
 func (o *fakeOS) cryptoUsers() string {
@@ -150,6 +152,18 @@ func (o *fakeOS) handleCommon(c call) ([]byte, error, bool) {
 			name = o.realName[user]
 		}
 		return []byte("RealName:\n " + name), nil, true
+	case c.name == "dscl" && len(c.args) == 4 && c.args[1] == "-read" && c.args[3] == "IsHidden":
+		user := strings.TrimPrefix(c.args[2], "/Users/")
+		if !o.exists[user] {
+			return []byte("<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)"), fakeExit{56}, true
+		}
+		if hidden, known := o.hidden[user]; known {
+			if hidden {
+				return []byte("IsHidden: 1"), nil, true
+			}
+			return []byte("IsHidden: 0"), nil, true
+		}
+		return []byte("No such key: IsHidden"), nil, true
 	case c.name == "dscl" && len(c.args) == 4 && c.args[1] == "-read" && c.args[3] == "accountPolicyData":
 		user := strings.TrimPrefix(c.args[2], "/Users/")
 		return []byte(fmt.Sprintf("dsAttrTypeNative:accountPolicyData:\n <plist><dict><key>failedLoginCount</key><integer>%d</integer></dict></plist>", o.failed[user])), nil, true
@@ -766,6 +780,20 @@ func TestManageSecureTokenReportsCoveredOnlyAfterPromptFails(t *testing.T) {
 	}
 }
 
+func TestRecoveryCoveredByMDMSucceedsInsideReserveWindow(t *testing.T) {
+	osState := &fakeOS{exists: map[string]bool{"localadmin": true}, token: map[string]bool{}}
+	f := &fakeRunner{}
+	f.handle = btCoveredHandler(osState, "true", nil, profilesEscrowedYES, nil)
+	m := newTestManager(t, f)
+
+	ctx, cancel := context.WithTimeout(context.Background(), vaultWriteReserve-30*time.Second)
+	defer cancel()
+
+	if !m.recoveryCoveredByMDM(ctx) {
+		t.Fatal("recoveryCoveredByMDM returned false when remaining run budget was inside vaultWriteReserve")
+	}
+}
+
 func TestManageSecureTokenPromptSuccessNeedsNoCoverageCheck(t *testing.T) {
 	osState := &fakeOS{exists: map[string]bool{"localadmin": true}, token: map[string]bool{}}
 	f := &fakeRunner{}
@@ -1256,6 +1284,9 @@ func TestVerifyPasswordReportsHelperVerdict(t *testing.T) {
 	}{
 		{name: "exit 0 is live", code: 0, want: true},
 		{name: "exit 2 is not live", code: 2, want: false},
+		{name: "exit 1 is an OpenDirectory error and proves nothing", code: 1, wantErr: true},
+		{name: "exit 3 is a locked account and proves nothing", code: 3, wantErr: true},
+		{name: "an unknown exit proves nothing", code: 9, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &fakeRunner{}
@@ -1271,6 +1302,12 @@ func TestVerifyPasswordReportsHelperVerdict(t *testing.T) {
 				return []byte("[SWIFT] Password rejected"), fakeExit{tc.code}
 			}
 			ok, err := newTestManager(t, f).VerifyPassword(context.Background(), "localadmin", "candidate-1")
+			if tc.wantErr {
+				if err == nil || ok {
+					t.Fatalf("exit %d must be an error and never a proven wrong password, got ok=%v err=%v", tc.code, ok, err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("VerifyPassword returned an error for a helper verdict: %v", err)
 			}
@@ -1460,6 +1497,27 @@ func TestManageSecureTokenWindowFailedStreakTurnsRed(t *testing.T) {
 	}
 }
 
+func TestManageSecureTokenWindowKilledBeforeItAppearsTurnsRed(t *testing.T) {
+	osState := &fakeOS{exists: map[string]bool{"localadmin": true}, token: map[string]bool{}}
+	f := &fakeRunner{}
+	f.handle = btCoveredHandler(osState, "true", nil, profilesEscrowedYES, nil)
+	m := newTestManager(t, f)
+	killedEarly := func() *fakeWindow { return &fakeWindow{neverShown: true, events: []any{io.EOF}} }
+	windowPrompt(t, m, f, "correct horse", killedEarly(), killedEarly())
+
+	if first := m.ManageSecureToken(context.Background(), "localadmin", "newpass", map[string]string{}); first != TokenStatusDisabledCovered {
+		t.Fatalf("first run: status = %q, want %q", first, TokenStatusDisabledCovered)
+	}
+	var second string
+	logged := captureLog(func() { second = m.ManageSecureToken(context.Background(), "localadmin", "newpass", map[string]string{}) })
+	if second != TokenStatusDisabledWindowKilled {
+		t.Fatalf("second run: status = %q, want %q", second, TokenStatusDisabledWindowKilled)
+	}
+	if !strings.Contains(logged, "[WINDOW ENDED STREAK]") || !strings.Contains(logged, "PROMPT: window-failed") {
+		t.Errorf("the second run needs the streak line and the window-failed word: %s", logged)
+	}
+}
+
 func TestManageSecureTokenWindowStartFailureIsNotAStreakRun(t *testing.T) {
 	osState := &fakeOS{exists: map[string]bool{"localadmin": true}, token: map[string]bool{}}
 	f := &fakeRunner{}
@@ -1522,7 +1580,10 @@ func TestManageSecureTokenLaterLeavesTheWrongPasswordStreak(t *testing.T) {
 	f.handle = btCoveredHandler(osState, "true", nil, profilesEscrowedYES, nil)
 	m := newTestManager(t, f)
 	windowPrompt(t, m, f, "correct horse", &fakeWindow{events: []any{dialogEvent{kind: eventLater}}})
-	writeState(t, m, `{"user":"alice","first_prompt":"2026-11-17T09:00:00Z","deferrals":0,"unanswered":0,"wrong_password_runs":3}`)
+	// Set a constant clock so the test does not depend on the current date.
+	clock := time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)
+	m.now = func() time.Time { return clock }
+	writeState(t, m, fmt.Sprintf(`{"user":"alice","first_prompt":"%s","deferrals":0,"unanswered":0,"wrong_password_runs":3}`, clock.Add(-24*time.Hour).Format(time.RFC3339)))
 
 	var status string
 	logged := captureLog(func() { status = m.ManageSecureToken(context.Background(), "localadmin", "newpass", map[string]string{}) })
@@ -1535,5 +1596,32 @@ func TestManageSecureTokenLaterLeavesTheWrongPasswordStreak(t *testing.T) {
 	}
 	if st := readState(t, m); st.WrongPasswordRuns != 3 || st.Deferrals != 1 {
 		t.Errorf("state = %+v, want streak 3 and one postponement", st)
+	}
+}
+
+func TestHelperVerifyActionReportsStructuredExitCodes(t *testing.T) {
+	raw, err := os.ReadFile("mac_helper.swift")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(raw)
+	if strings.Contains(src, "verifyPasswordNative(user: payload.targetUser, pass: payload.targetPass) ? 0 : 1") {
+		t.Error("verify_password exits 1 for a wrong password, a lock and an OpenDirectory error alike")
+	}
+	for _, required := range []string{
+		"func verifyPasswordNative(user: String, pass: String) -> ChangeOutcome",
+		"exit(verifyPasswordNative(user: payload.targetUser, pass: payload.targetPass).rawValue)",
+		"guard let record else {\n        fputs(\"[SWIFT] User \\(user) not found in OpenDirectory\\n\", stderr)\n        return .odError\n    }",
+		"case odErrorInvalidCredentials: outcome = .authFailed",
+		"case odErrorAccountLocked, odErrorAccountTemporarilyLocked: outcome = .locked",
+		"default: outcome = .odError",
+		"case odErrorAccountLocked, odErrorAccountTemporarilyLocked: outcome = .locked\n            case odErrorPolicyViolations: outcome = .policyRejected",
+	} {
+		if !strings.Contains(src, required) {
+			t.Errorf("mac_helper.swift does not contain %s", required)
+		}
+	}
+	if strings.Count(src, "case odErrorAccountLocked:") != 0 {
+		t.Error("a switch on the OpenDirectory code maps 5305 without 5304")
 	}
 }

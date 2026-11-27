@@ -62,29 +62,14 @@ if ($isMember) {
 Write-Output 'LAPS_RESULT=OK'
 `
 
+// serialScript prints tagged lines because Windows PowerShell 5.1 can mix progress XML into stdout.
 const serialScript = `
-$ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
-$placeholders = @(
-    'unknown', 'to be filled by o.e.m.', 'default string', '0',
-    'system serial number', 'chassis serial number', 'board serial number',
-    'not specified', 'none', 'n/a'
-)
-function Test-ValidSerial($s) {
-    if ([string]::IsNullOrWhiteSpace($s)) { return $false }
-    $t = $s.Trim()
-    if ($t -match '^[0-]+$' -or $t -match '^[fF-]+$') { return $false }
-    if ($placeholders -contains $t.ToLowerInvariant()) { return $false }
-    return $true
-}
-$serial = (Get-CimInstance -ClassName Win32_BIOS).SerialNumber
-if (-not (Test-ValidSerial $serial)) {
-    $serial = (Get-CimInstance -ClassName Win32_ComputerSystemProduct).IdentifyingNumber
-}
-if (-not (Test-ValidSerial $serial)) {
-    $serial = (Get-CimInstance -ClassName Win32_ComputerSystemProduct).UUID
-}
-Write-Output $serial
+$ErrorActionPreference = 'SilentlyContinue'
+Write-Output ('BIOS=' + (Get-CimInstance -ClassName Win32_BIOS).SerialNumber)
+$csp = Get-CimInstance -ClassName Win32_ComputerSystemProduct
+Write-Output ('CSP=' + $csp.IdentifyingNumber)
+Write-Output ('UUID=' + $csp.UUID)
 `
 
 func powerShellPath(systemRoot string) string {
@@ -150,4 +135,34 @@ func validateWindowsSerial(raw string) (string, error) {
 		}
 	}
 	return serial, nil
+}
+
+func pickWindowsSerial(raw string) (string, error) {
+	var firstErr error
+	tagged := false
+	for _, line := range strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		value, ok := strings.CutPrefix(line, "BIOS=")
+		if !ok {
+			value, ok = strings.CutPrefix(line, "CSP=")
+		}
+		if !ok {
+			value, ok = strings.CutPrefix(line, "UUID=")
+		}
+		if !ok {
+			continue
+		}
+		tagged = true
+		serial, err := validateWindowsSerial(value)
+		if err == nil {
+			return serial, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if !tagged {
+		return "", errors.New("the serial script printed no tagged BIOS, CSP, or UUID line")
+	}
+	return "", firstErr
 }

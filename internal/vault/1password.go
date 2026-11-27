@@ -58,7 +58,7 @@ func withRetry[T any](ctx context.Context, what string, call func(context.Contex
 			log.Printf("[WARNING] %s failed (attempt %d/%d): %v. Retrying...\n", what, attempt, opAttempts, err)
 			select {
 			case <-ctx.Done():
-				return zero, fmt.Errorf("%s failed after %d attempts: %w", what, attemptsRun, lastErr)
+				return zero, fmt.Errorf("%s failed after %d attempts; the run budget ended during the pause (%v): %w", what, attemptsRun, ctx.Err(), lastErr)
 			case <-time.After(retryBackoff(attempt)):
 			}
 		}

@@ -11,7 +11,9 @@ Run the local build script from the repository root:
 The script sets the version in `internal/version/version.go` and `scripts/mdm/macos/audit_laps_customapp.sh`. It then creates a `release/` directory with these artifacts:
 
 - `golaps_windows_amd64.exe` and its `.sha256` checksum
-- `golaps_v<version>.pkg` (`golaps`, `mac_helper`, and `golaps_auth`, packaged with `pkgbuild`)
+- `golaps_v<version>.pkg` (`golaps`, `mac_helper`, `golaps_auth`, and optional `assets/backdrop.jpg` at `/usr/local/golaps/backdrop.jpg`, packaged with `pkgbuild`)
+
+If `assets/backdrop.jpg` exists in the repository, `build.sh` copies it into the `.pkg` payload at `/usr/local/golaps/backdrop.jpg` for the screen-block backdrop.
 
 For signed production releases, set `CODESIGN_IDENTITY`, `INSTALLER_IDENTITY`, and `GOLAPS_VERSION` before you run `build.sh`.
 

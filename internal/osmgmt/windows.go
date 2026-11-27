@@ -84,7 +84,7 @@ func (w *WindowsManager) GetSystemInfo(ctx context.Context) (string, string, err
 	if err != nil {
 		return hostname, "", fmt.Errorf("could not read the machine serial: %w", err)
 	}
-	serial, err := validateWindowsSerial(out)
+	serial, err := pickWindowsSerial(out)
 	if err != nil {
 		return hostname, "", err
 	}

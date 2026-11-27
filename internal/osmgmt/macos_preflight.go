@@ -160,7 +160,7 @@ func (m *MacOSManager) repairServiceAccount(ctx context.Context, user string) er
 			}
 		}
 
-		// Clear per-user change-required policies only; never alter global or profile policies.
+		// Clear per-user change-required policies only and leave global or profile policies unchanged.
 		log.Printf("[REPAIR] setpolicy output: %s\n", m.evidence(ctx, 200, toolPwpolicy, "-u", user, "-setpolicy", "newPasswordRequired=0 maxMinutesUntilChangePassword=0"))
 		verdict = m.pwpolicyVerdict(ctx, user)
 		log.Printf("[REPAIR] verdict after legacy-policy reset: %s\n", verdict)
@@ -195,7 +195,7 @@ func (m *MacOSManager) clearBridgeCounter(ctx context.Context) {
 	m.clearFailedLoginCounter(ctx, LegacyBridgeAdmin)
 }
 
-// Matches both Apple phrasings: "is not allowed to authenticate" and "is not be allowed to authenticate until password is changed".
+// Matches both Apple phrasings for a blocked account in pwpolicy output.
 func authenticationBlocked(verdict string) bool {
 	return strings.Contains(verdict, "not") && strings.Contains(verdict, "allowed to authenticate")
 }
@@ -231,7 +231,7 @@ func (m *MacOSManager) failedLoginCount(ctx context.Context, user string) int {
 	return n
 }
 
-// clearFailedLoginCounter removes failedLoginCount and failedLoginTimestamp as root without spending an auth attempt.
+// clearFailedLoginCounter deletes failedLoginCount and failedLoginTimestamp as root without spending an auth attempt.
 func (m *MacOSManager) clearFailedLoginCounter(ctx context.Context, user string) {
 	for _, key := range []string{"failedLoginCount", "failedLoginTimestamp"} {
 		if out, err := m.run.Run(ctx, "", toolDscl, ".", "-deletepl", "/Users/"+user, "accountPolicyData", key); err != nil {
@@ -251,7 +251,7 @@ func (m *MacOSManager) conflictError(ctx context.Context, user string, count int
 }
 
 func (m *MacOSManager) nativeLAPSActivity(ctx context.Context) (item string, attempts int) {
-	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	ctx, cancel := withReserve(ctx, 90*time.Second, vaultWriteReserve)
 	defer cancel()
 	out, err := m.run.Run(ctx, "", toolLog, "show", "--last", "1d", "--style", "compact", "--predicate", nativeLAPSLogPredicate)
 	if err != nil {
@@ -314,7 +314,7 @@ func (m *MacOSManager) inAdminGroup(ctx context.Context, user string) bool {
 	return err == nil
 }
 
-// CleanupLegacyAdmin removes laps-bridge via sysadminctl once targetUser holds a Secure Token (or if the bridge has no token).
+// CleanupLegacyAdmin deletes laps-bridge via sysadminctl once targetUser holds a Secure Token (or if the bridge has no token).
 func (m *MacOSManager) CleanupLegacyAdmin(ctx context.Context, targetUser string) bool {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
@@ -336,7 +336,7 @@ func (m *MacOSManager) CleanupLegacyAdmin(ctx context.Context, targetUser string
 	}
 	hasToken, err := m.secureTokenState(ctx, targetUser)
 	if err != nil || !hasToken {
-		// A token-less bridge cannot unlock FileVault, so remove it once targetUser is an admin again.
+		// A token-less bridge cannot unlock FileVault, so delete it once targetUser is an admin again.
 		bridgeToken, tokenErr := m.secureTokenState(ctx, LegacyBridgeAdmin)
 		if m.isBridgeAccount(ctx) && tokenErr == nil && !bridgeToken && m.inAdminGroup(ctx, targetUser) {
 			log.Printf("[INFO] '%s' is a token-less LAPS bridge and '%s' is an admin again. Removing the bridge; a bridge without a token is no recovery path.\n", LegacyBridgeAdmin, targetUser)

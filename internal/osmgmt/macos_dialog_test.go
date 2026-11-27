@@ -97,7 +97,7 @@ func dialogManager(t *testing.T, win *fakeWindow, openErr error, correct string)
 			return []byte(ioregUnlocked), nil
 		}
 		if c.is("dseditgroup", "-o", "checkmember", "-m", "alice", "admin") {
-			return []byte("no alice is NOT a member of admin"), fakeExit{67}
+			return []byte("yes alice is a member of admin"), nil
 		}
 		if c.name != "mac_helper" {
 			t.Fatalf("unexpected command: %s", c)
@@ -268,11 +268,41 @@ func readState(t *testing.T, m *MacOSManager) promptState {
 	if err != nil {
 		t.Fatalf("no prompt state on disk: %v", err)
 	}
-	var st promptState
-	if err := json.Unmarshal(raw, &st); err != nil {
+	var file struct {
+		Records map[string]promptState `json:"records"`
+		promptState
+	}
+	if err := json.Unmarshal(raw, &file); err != nil {
 		t.Fatalf("prompt state is not JSON: %v | %s", err, raw)
 	}
+	if file.Records == nil {
+		return file.promptState
+	}
+	st, ok := file.Records["alice"]
+	if !ok {
+		t.Fatalf("the prompt state has no record of alice: %s", raw)
+	}
 	return st
+}
+
+func TestPromptStateKeepsARecordForEachUser(t *testing.T) {
+	win := &fakeWindow{events: []any{dialogEvent{kind: eventTimeout}}}
+	m, _, requests := dialogManager(t, win, nil, "correct horse")
+	m.now = func() time.Time { return promptDay }
+	writeState(t, m, `{"user":"bob","first_prompt":"2026-11-16T09:00:00Z","deferrals":2,"unanswered":3,"wrong_password_runs":1,"window_failed_runs":1}`)
+
+	ask(m, context.Background(), false)
+
+	if got := (*requests)[0].DeferralsLeft; got != maxDeferrals {
+		t.Errorf("alice got %d postponement(s), want a full budget of %d", got, maxDeferrals)
+	}
+	if alice := readState(t, m); alice.User != "alice" || alice.Unanswered != 1 {
+		t.Errorf("record of alice = %+v, want one unanswered prompt", alice)
+	}
+	bob := m.loadPromptState("bob")
+	if bob.Deferrals != 2 || bob.Unanswered != 3 || bob.WrongPasswordRuns != 1 || bob.WindowFailedRuns != 1 {
+		t.Errorf("record of bob = %+v, want it unchanged after the prompt of alice", bob)
+	}
 }
 
 func TestFirstPromptStartsTheDeferralBudget(t *testing.T) {
@@ -654,6 +684,24 @@ func TestSavePromptStateLeavesOneFile(t *testing.T) {
 	}
 }
 
+func TestReadPromptRecordsRefusesSymlink(t *testing.T) {
+	m, _, _ := dialogManager(t, &fakeWindow{}, nil, "correct horse")
+	dir := filepath.Dir(m.promptStatePath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "target.json")
+	if err := os.WriteFile(target, []byte(`{"user":"alice","first_prompt":"2026-11-16T09:00:00Z","deferrals":2}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, m.promptStatePath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.readPromptRecords(); err == nil {
+		t.Fatal("readPromptRecords followed a symlink")
+	}
+}
+
 func adminAfter(f *fakeRunner, from int) {
 	inner := f.handle
 	checks := 0
@@ -663,6 +711,7 @@ func adminAfter(f *fakeRunner, from int) {
 			if checks >= from {
 				return []byte("yes alice is a member of admin"), nil
 			}
+			return []byte("no alice is NOT a member of admin"), fakeExit{67}
 		}
 		return inner(c)
 	}
@@ -711,8 +760,8 @@ func TestAdminStepIsSkippedForAnAdmin(t *testing.T) {
 	if outcome != passwordOK {
 		t.Fatalf("got %v, want passwordOK", outcome)
 	}
-	if (*requests)[0].NeedAdmin || f.count("dseditgroup") != 0 {
-		t.Errorf("needAdmin=%v, group checks=%d: an admin must go to the password step at once", (*requests)[0].NeedAdmin, f.count("dseditgroup"))
+	if (*requests)[0].NeedAdmin || f.count("dseditgroup") != 1 || len(win.views) == 0 || win.views[0] != viewWorking {
+		t.Errorf("needAdmin=%v, group checks=%d, views=%v: an admin must go from the password to the grant at once", (*requests)[0].NeedAdmin, f.count("dseditgroup"), win.views)
 	}
 }
 
@@ -788,6 +837,44 @@ func TestWindowThatNeverAppearsStartsNothing(t *testing.T) {
 	}
 	if win.closed == 0 {
 		t.Error("the window process was not closed")
+	}
+}
+
+func TestWindowThatEndsBeforeItAppearsCountsTowardTheStreak(t *testing.T) {
+	cases := []struct {
+		name  string
+		first any
+	}{
+		{"the process ended", io.EOF},
+		{"the process stayed silent", context.DeadlineExceeded},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			win := &fakeWindow{neverShown: true, events: []any{tc.first}}
+			m, _, _ := dialogManager(t, win, nil, "correct horse")
+			m.now = func() time.Time { return promptDay }
+			writeState(t, m, `{"user":"alice","first_prompt":"2026-11-16T09:00:00Z","deferrals":1,"unanswered":4,"window_failed_runs":1}`)
+
+			outcome, tally := m.askPassword(context.Background(), "501", "alice", false, nil)
+
+			if outcome != passwordUnavailable || !tally.windowFailed || tally.windowFailedRuns != 2 {
+				t.Fatalf("got (%v, %+v), want (passwordUnavailable, windowFailed with a streak of 2)", outcome, tally)
+			}
+			if st := readState(t, m); st.WindowFailedRuns != 2 || st.Unanswered != 4 || st.Deferrals != 1 {
+				t.Errorf("state = %+v, want window_failed_runs 2 and the budget unchanged", st)
+			}
+		})
+	}
+}
+
+func TestWindowThatEndsBeforeItAppearsLeavesARecord(t *testing.T) {
+	m, _, _ := dialogManager(t, &fakeWindow{neverShown: true, events: []any{io.EOF}}, nil, "correct horse")
+	m.now = func() time.Time { return promptDay }
+
+	m.askPassword(context.Background(), "501", "alice", false, nil)
+
+	if st := readState(t, m); st.User != "alice" || st.WindowFailedRuns != 1 {
+		t.Errorf("state = %+v, want a record of alice with window_failed_runs 1", st)
 	}
 }
 
@@ -887,7 +974,7 @@ func TestGrantIsRepeatedAfterALostAdminSession(t *testing.T) {
 	tick := context.DeadlineExceeded
 	win := &fakeWindow{events: []any{typed("correct horse"), dialogEvent{kind: eventAdminRequested}, tick}}
 	m, f, _ := dialogManager(t, win, nil, "correct horse")
-	adminAfter(f, 2) // not an admin at the check after the failed grant, an admin at the next poll
+	adminSequence(f, true, false, true) // an admin at the typed password, not an admin at the check after the failed grant, an admin at the next poll
 	grants := 0
 
 	outcome, _ := m.askPassword(context.Background(), "501", "alice", false, func(context.Context, string) error {
@@ -1110,8 +1197,10 @@ func TestReadPasswordLogsADroppedConnection(t *testing.T) {
 			}
 			events = append(events, ev)
 		}
+		// Read the log buffer only after close, because the socket goroutine writes to it until then.
+		win.close()
 	})
-	if events[1].kind != eventLater {
+	if events[0].kind != eventShown || events[1].kind != eventLater {
 		t.Fatalf("events = %+v, want shown then later: the two bad connections must not become events", events)
 	}
 	if !strings.Contains(logged, "checked that the password socket is reachable") || strings.Count(logged, "ended before a full line arrived") != 1 {
@@ -1119,6 +1208,55 @@ func TestReadPasswordLogsADroppedConnection(t *testing.T) {
 	}
 	if !strings.Contains(logged, "ended before a full line arrived") || !strings.Contains(logged, "received an empty line") {
 		t.Errorf("the dropped connections left no warning: %s", logged)
+	}
+}
+
+func TestDroppedConnectionsHaveALogLimit(t *testing.T) {
+	sock := testSocket(t)
+	script := `read -r req; printf '{"event":"shown"}\n'; i=0; while [ $i -lt 12 ]; do : | nc -U "$1"; i=$((i+1)); done; printf '{"event":"later"}\n'; read -r rest`
+	win, err := startPipeWindow(exec.Command("/bin/sh", "-c", script, "sh", sock), dialogRequest{Attempt: 1, MaxAttempts: 5}, sock, os.Getuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	logged := captureLog(func() {
+		defer win.close()
+		for _, want := range []dialogEventKind{eventShown, eventLater} {
+			if ev, err := win.next(ctx); err != nil || ev.kind != want {
+				t.Fatalf("event = (%+v, %v), want kind %v", ev, err, want)
+			}
+		}
+	})
+	if n := strings.Count(logged, "checked that the password socket is reachable"); n != socketLogLimit {
+		t.Errorf("%d lines for 12 empty connections, want %d: %s", n, socketLogLimit, logged)
+	}
+	if !strings.Contains(logged, `12 connections of the kind "probe"`) {
+		t.Errorf("the close of the socket must report the total of 12: %s", logged)
+	}
+}
+
+func TestPasswordLineWithoutAnEndIsReportedAsTooLong(t *testing.T) {
+	sock := testSocket(t)
+	script := `read -r req; printf '{"event":"shown"}\n'; head -c 70000 /dev/zero | tr '\0' a | nc -U "$1"; printf '{"event":"later"}\n'; read -r rest`
+	win, err := startPipeWindow(exec.Command("/bin/sh", "-c", script, "sh", sock), dialogRequest{Attempt: 1, MaxAttempts: 5}, sock, os.Getuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	logged := captureLog(func() {
+		defer win.close()
+		for _, want := range []dialogEventKind{eventShown, eventLater} {
+			if ev, err := win.next(ctx); err != nil || ev.kind != want {
+				t.Fatalf("event = (%+v, %v), want kind %v", ev, err, want)
+			}
+		}
+	})
+	if !strings.Contains(logged, "is longer than") || strings.Contains(logged, "ended before a full line arrived") {
+		t.Errorf("want the too-long line and no early-end line: %s", logged)
 	}
 }
 
@@ -1290,7 +1428,7 @@ func TestAuthWindowSourceKeepsTheContract(t *testing.T) {
 	}
 	src := strings.Join(code, "\n")
 
-	for _, required := range []string{helpArticleURL, teamITChannelURL, backdropPath, authSocketPath, "Waiting for the next attempt", "pauseEnding", `"later"`, `"timeout"`, `"shown"`, `"abr"`, `"wrong"`, `"show"`, `"` + viewAdmin + `"`, `"` + viewPassword + `"`, `"` + viewWorking + `"`, `"` + viewDone + `"`, `"` + viewError + `"`, `"` + viewFailed + `"`, `"` + viewPaused + `"`, "deferralsLeft", "blockScreen", "maxAttempts", "timeoutSeconds", "seconds", "didWakeNotification"} {
+	for _, required := range []string{helpArticleURL, teamITChannelURL, backdropPath, authSocketPath, "signal(SIGPIPE, SIG_IGN)", "SO_NOSIGPIPE", "Waiting for the next attempt", "pauseEnding", "Your administrator access ended", "adminLost", `"later"`, `"timeout"`, `"shown"`, `"abr"`, `"wrong"`, `"show"`, `"` + viewAdmin + `"`, `"` + viewPassword + `"`, `"` + viewWorking + `"`, `"` + viewDone + `"`, `"` + viewError + `"`, `"` + viewFailed + `"`, `"` + viewPaused + `"`, "deferralsLeft", "blockScreen", "maxAttempts", "timeoutSeconds", "seconds", "didWakeNotification"} {
 		if !strings.Contains(src, required) {
 			t.Errorf("auth_window.swift does not contain %s", required)
 		}
@@ -1698,6 +1836,34 @@ func TestWrongPasswordPauseFromTheFifthRun(t *testing.T) {
 	}
 }
 
+func TestWrongPasswordPauseHappensOncePerRun(t *testing.T) {
+	blocker := func(ctx context.Context) (dialogEvent, error) { <-ctx.Done(); return dialogEvent{}, ctx.Err() }
+	events := append(wrongFive(), blocker)
+	events = append(events, wrongFive()...)
+	events = append(events, typed("correct horse"))
+	win := &fakeWindow{events: events}
+	m, f, _ := dialogManager(t, win, nil, "correct horse")
+	adminAfter(f, 1)
+	m.wrongPasswordPause = 20 * time.Millisecond
+	writeState(t, m, streakState(4, blockScreenAfter))
+
+	var outcome passwordOutcome
+	logged := captureLog(func() { _, outcome, _ = askWithStreak(m, context.Background()) })
+
+	if outcome != passwordFailed {
+		t.Fatalf("outcome = %v, want passwordFailed: the second batch of wrong passwords ends the prompt; log: %s", outcome, logged)
+	}
+	if !reflect.DeepEqual(win.pauses, []int{0}) {
+		t.Errorf("pauses = %v, want one pause", win.pauses)
+	}
+	if n := f.count("mac_helper"); n != 2*maxPasswordAttempts {
+		t.Errorf("helper ran %d time(s), want %d: ten checks of the console user in one run at most", n, 2*maxPasswordAttempts)
+	}
+	if got := win.views[len(win.views)-1]; got != viewFailed {
+		t.Errorf("last view = %q, want %q", got, viewFailed)
+	}
+}
+
 func TestWrongPasswordPauseSendsTheSeconds(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1807,6 +1973,32 @@ func adminSequence(f *fakeRunner, members ...bool) {
 	}
 }
 
+func TestAdminSessionIsCheckedBeforeEachPassword(t *testing.T) {
+	win := &fakeWindow{events: []any{typed("typo"), typed("stale try"), context.DeadlineExceeded, typed("correct horse")}}
+	m, f, _ := dialogManager(t, win, nil, "correct horse")
+	adminSequence(f, true, false, true)
+
+	var got string
+	var outcome passwordOutcome
+	logged := captureLog(func() { got, outcome = ask(m, context.Background(), false) })
+
+	if outcome != passwordOK || got != "correct horse" {
+		t.Fatalf("got (%q, %v), want the correct password and passwordOK; log: %s", got, outcome, logged)
+	}
+	if want := []string{viewAdmin, viewPassword, viewWorking, viewDone}; !reflect.DeepEqual(win.views, want) {
+		t.Errorf("views = %v, want %v", win.views, want)
+	}
+	if n := f.count("mac_helper"); n != 2 {
+		t.Errorf("helper calls = %d, want 2: the password typed without admin rights must not be checked", n)
+	}
+	if !reflect.DeepEqual(win.wrongs, []int{2}) {
+		t.Errorf("wrong commands = %v, want [2]: the attempt without admin rights must not be consumed", win.wrongs)
+	}
+	if !strings.Contains(logged, "lost the administrator session") {
+		t.Errorf("no log line for the lost session: %s", logged)
+	}
+}
+
 func TestAdminSessionIsCheckedBeforeEachAttemptAfterThePause(t *testing.T) {
 	clock := &fakeClock{t: time.Now()}
 	jump := func(ctx context.Context) (dialogEvent, error) {
@@ -1816,7 +2008,7 @@ func TestAdminSessionIsCheckedBeforeEachAttemptAfterThePause(t *testing.T) {
 	}
 	win := &fakeWindow{events: append(wrongFive(), jump, typed("stale try"), context.DeadlineExceeded, typed("correct horse"))}
 	m, f := pausedRun(t, win, clock, 10*time.Millisecond)
-	adminSequence(f, true, false, true)
+	adminSequence(f, true, true, true, true, true, true, false, true)
 
 	var outcome passwordOutcome
 	logged := captureLog(func() { _, outcome, _ = askWithStreak(m, context.Background()) })
@@ -1834,7 +2026,7 @@ func TestAdminSessionIsCheckedBeforeEachAttemptAfterThePause(t *testing.T) {
 	if len(win.wrongs) != maxPasswordAttempts-1 {
 		t.Errorf("wrong commands = %v: the attempt without admin rights must not be consumed", win.wrongs)
 	}
-	if !strings.Contains(logged, "lost the administrator session after the pause") {
+	if !strings.Contains(logged, "lost the administrator session") {
 		t.Errorf("no log line for the lost session: %s", logged)
 	}
 }
@@ -1855,6 +2047,15 @@ func TestWindowFailedRunsCountAndReset(t *testing.T) {
 	}
 	if _, tally := m.askPassword(context.Background(), "501", "alice", false, nil); tally.windowFailed || tally.windowFailedRuns != 1 {
 		t.Fatalf("a postponement changed the streak: %+v", tally)
+	}
+
+	for name, events := range map[string][]any{"a timeout": {dialogEvent{kind: eventTimeout}}, "five wrong passwords": wrongFive()} {
+		m.openWindow = func(context.Context, string, string, dialogRequest) (passwordWindow, error) {
+			return &fakeWindow{events: events}, nil
+		}
+		if _, tally := m.askPassword(context.Background(), "501", "alice", false, nil); tally.windowFailed || tally.windowFailedRuns != 1 {
+			t.Fatalf("%s changed the streak: %+v", name, tally)
+		}
 	}
 
 	m.openWindow = func(context.Context, string, string, dialogRequest) (passwordWindow, error) {
@@ -1957,24 +2158,24 @@ func TestWrongPasswordPauseWaitsForTheWallClock(t *testing.T) {
 func TestAdminSessionIsCheckedAgainAfterThePause(t *testing.T) {
 	cases := []struct {
 		name       string
-		memberFrom int
+		members    []bool
 		events     []any
 		wantViews  []string
 		wantChecks int
 	}{
 		{
 			name:       "the session ended during the pause",
-			memberFrom: 2,
+			members:    []bool{true, true, true, true, true, false, true},
 			events:     []any{context.DeadlineExceeded, typed("correct horse")},
 			wantViews:  []string{viewAdmin, viewPassword, viewWorking, viewDone},
-			wantChecks: 3,
+			wantChecks: 8,
 		},
 		{
 			name:       "the session is still there",
-			memberFrom: 1,
+			members:    []bool{true},
 			events:     []any{typed("correct horse")},
 			wantViews:  []string{viewPassword, viewWorking, viewDone},
-			wantChecks: 2,
+			wantChecks: 7,
 		},
 	}
 	for _, tc := range cases {
@@ -1987,7 +2188,7 @@ func TestAdminSessionIsCheckedAgainAfterThePause(t *testing.T) {
 			}
 			win := &fakeWindow{events: append(append(wrongFive(), jump), tc.events...)}
 			m, f := pausedRun(t, win, clock, 10*time.Millisecond)
-			adminAfter(f, tc.memberFrom)
+			adminSequence(f, tc.members...)
 
 			var outcome passwordOutcome
 			logged := captureLog(func() { _, outcome, _ = askWithStreak(m, context.Background()) })
@@ -2002,8 +2203,9 @@ func TestAdminSessionIsCheckedAgainAfterThePause(t *testing.T) {
 				t.Errorf("admin group checks = %d, want %d", n, tc.wantChecks)
 			}
 			lost := strings.Contains(logged, "[INFO] alice lost the administrator session during the pause; asking for Admin By Request again.")
-			if lost != (tc.memberFrom > 1) {
-				t.Errorf("lost-session log line present = %v, want %v: %s", lost, tc.memberFrom > 1, logged)
+			wantLost := len(tc.members) > 1
+			if lost != wantLost {
+				t.Errorf("lost-session log line present = %v, want %v: %s", lost, wantLost, logged)
 			}
 		})
 	}

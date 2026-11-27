@@ -8,8 +8,8 @@ import SwiftUI
 signal(SIGPIPE, SIG_IGN)
 
 // Native SwiftUI/AppKit auth window run as the console user by golaps (root).
-// Protocol: JSON lines on stdin/stdout; typed passwords travel only over the root-owned Unix socket.
-// All UI text is compiled in so external callers cannot inject phishing text.
+// Protocol: JSON lines on stdin/stdout. Typed passwords travel only over the root-owned Unix socket.
+// The binary contains all UI text so external callers cannot inject phishing text.
 
 enum Copy {
     static let title = "IT Security Update"
@@ -29,6 +29,7 @@ enum Copy {
     static let adminBody = "IT is finishing a security update on this Mac. One step requires temporary administrator access for your account.\n\n1. Click \"Open Admin By Request\".\n2. Select \"Request administrator access\" and confirm with Yes.\n\nThis window continues automatically after macOS grants access."
     static let adminButton = "Open Admin By Request"
     static let adminWaiting = "Approve the request in the Admin By Request window."
+    static let adminLost = "Your administrator access ended before the update finished. Click \"Open Admin By Request\" again."
     static let body = "IT is updating macOS security settings.\n\nWe are adding a background IT account for FileVault data recovery. To finish this process, macOS requires your local login password.\n\nTo check that this window is real, contact your IT support team."
     static let fieldLabel = "Mac login password"
     static let fieldPlaceholder = "Enter your password"
@@ -122,7 +123,7 @@ func finish(event: String) -> Never {
     quit(0)
 }
 
-// PasswordChannel verifies peer UID via getpeereid before sending passwords over the Unix socket.
+// PasswordChannel checks peer UID via getpeereid before sending passwords over the Unix socket.
 enum PasswordChannel {
 #if LAPS_TEST
     static let path = String(cString: getenv("LAPS_TEST_AUTH_SOCKET"))
@@ -228,9 +229,9 @@ final class WindowState: ObservableObject {
     @Published var message: String?
     @Published var isWaiting = false
     @Published var adminRequested = false
+    @Published var adminLost = false
     @Published var layoutName: String?
     @Published var pauseLeft = 0
-    // isPaused stays true until the parent sends view "password" so early submissions are not dropped.
     @Published var isPaused = false
     @Published var pauseEnding = false
 
@@ -245,7 +246,6 @@ final class WindowState: ObservableObject {
     private let timeout: TimeInterval
     private var idleTimer: Timer?
     private var pauseTimer: Timer?
-    // Track pause end by wall clock (plus wake notifications) because Timer freezes during macOS sleep.
     private var pauseUntil: Date?
     private var wakeObserver: NSObjectProtocol?
 
@@ -263,7 +263,6 @@ final class WindowState: ObservableObject {
         restartIdleTimer()
     }
 
-    // Add timer to .common run loop modes so it still fires while the user drags the window.
     private func restartIdleTimer() {
         idleTimer?.invalidate()
         let timer = Timer(timeInterval: timeout, repeats: false) { _ in
@@ -284,6 +283,7 @@ final class WindowState: ObservableObject {
         case "admin":
             clearPause()
             hasAdminStep = true
+            adminLost = true
             step = .admin
             adminRequested = false
             isWaiting = false
@@ -400,13 +400,11 @@ final class WindowState: ObservableObject {
         }
         isWaiting = true
         message = nil
- // Without the socket of root the window has no safe way to give the password. It ends. The parent then logs a failed window, and the prompt returns on the next check-in.
         guard PasswordChannel.deliver(password) else { quit(4) }
         password = ""
         restartIdleTimer()
     }
 
- // The parent checked the password and it was wrong. The parent owns the attempt number.
     func showWrongPassword(attempt next: Int) {
         attempt = min(max(next, 1), maxAttempts)
         message = Copy.wrongPassword(attempt: attempt, of: maxAttempts)
@@ -418,7 +416,6 @@ final class WindowState: ObservableObject {
         finish(event: "later")
     }
 
- // The window runs as the console user in the session of that user. The link therefore opens in the user's default browser.
     func openHelp() {
         if let url = URL(string: Copy.helpArticle) {
             NSWorkspace.shared.open(url)
@@ -427,11 +424,6 @@ final class WindowState: ObservableObject {
     }
 }
 
-// ==============================================================================
-// 5. VIEW
-// ==============================================================================
-
-// The two button looks of the window, in the brand colours. The system styles take the accent colour of the user, which is not always blue.
 struct PrimaryButton: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
 
@@ -439,7 +431,6 @@ struct PrimaryButton: ButtonStyle {
         configuration.label
             .font(.system(size: 13, weight: .semibold))
             .foregroundColor(.white)
- // A button label stays on one line. A label that wraps makes the button two lines high.
             .lineLimit(1)
             .fixedSize()
             .padding(.horizontal, 16)
@@ -465,7 +456,6 @@ struct SecondaryButton: ButtonStyle {
     }
 }
 
-// BackdropView draws the backdrop picture so that it fills the view. The picture keeps its proportions, and the part that does not fit is cut off equally on both sides. The view draws the picture itself and does not use a layer. The same code then draws on the screen and in an offscreen check.
 final class BackdropView: NSView {
     var picture: NSImage?
 
@@ -482,17 +472,15 @@ final class BackdropView: NSView {
     }
 }
 
-// Backdrop covers each screen behind the window. It is the last step of the escalation, and the parent turns it on. It is a strong reminder and not a lock: the window still closes after the timeout, and the system shortcuts still work.
+// Backdrop covers each screen behind the window when blockScreen is true.
 final class Backdrop {
     private var windows: [NSWindow] = []
     private var resumeTimer: Timer?
 
     func show() {
- // Without the picture file the backdrop is plain dark. The block must not depend on a picture.
         let picture = NSImage(contentsOfFile: Copy.backdropFile)
         for screen in NSScreen.screens {
             let cover = NSWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
- // One level below the window, above the windows of all other apps.
             cover.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue - 1)
             cover.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
             cover.isOpaque = true
@@ -506,8 +494,6 @@ final class Backdrop {
         }
     }
 
- // The help article opens in a browser, and the backdrop would hide it. The backdrop therefore moves away for a short time and then comes back.
- // hide takes the backdrop away for good. The task ended, so there is nothing left to remind the user of.
     func hide() {
         resumeTimer?.invalidate()
         windows.forEach { $0.orderOut(nil) }
@@ -625,10 +611,8 @@ struct AuthView: View {
         .padding(24)
         .frame(width: 520)
         .foregroundColor(Brand.text)
- // The brand colour is not fully opaque, so the backdrop picture shows through the blur a little.
         .background(Brand.background.opacity(0.94))
         .background(.ultraThinMaterial)
- // The window has no frame of the system, so the view makes the round corners itself.
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .onAppear { focusPassword() }
         .onChange(of: state.isWaiting) { waiting in
@@ -662,7 +646,6 @@ struct AuthView: View {
         }
     }
 
- // The list of the steps. It stays in the window from the first view to the last, so the user always sees the full task and the place in it.
     private var pipeline: some View {
         VStack(alignment: .leading, spacing: 10) {
             if state.hasAdminStep {
@@ -748,6 +731,9 @@ struct AuthView: View {
 
     private var adminStep: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if state.adminLost {
+                banner(Copy.adminLost)
+            }
             plainText(Copy.adminBody)
             if state.adminRequested {
                 Text(Copy.adminWaiting)
@@ -782,7 +768,6 @@ struct AuthView: View {
                     notice(Copy.keyboardLayout(layout), icon: "keyboard", colour: Brand.orange)
                 }
                 if state.isPaused {
- // The countdown shows whole minutes and rounds up, so it never shows zero while it runs. At zero the window waits for the parent.
                     notice(state.pauseEnding ? Copy.pauseEnding : Copy.paused(minutes: (state.pauseLeft + 59) / 60), icon: "clock.fill", colour: Brand.red)
                 } else if let message = state.message {
                     notice(message, icon: "exclamationmark.triangle.fill", colour: Brand.red)
@@ -816,6 +801,22 @@ struct AuthView: View {
         .foregroundColor(colour)
     }
 
+    private func banner(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 14))
+            Text(text)
+                .font(.system(size: 13, weight: .semibold))
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .foregroundColor(Brand.orange)
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Brand.orange.opacity(0.14)))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Brand.orange.opacity(0.6), lineWidth: 1))
+        .accessibilityElement(children: .combine)
+    }
+
     private var buttons: some View {
         HStack(spacing: 10) {
             switch state.step {
@@ -834,7 +835,6 @@ struct AuthView: View {
             Spacer()
 
             if (state.step == .admin || state.step == .password) && state.deferralsLeft > 0 {
- // No Escape shortcut on purpose. A reflex key press must not use one of the postponements.
                 Button(Copy.laterButton(left: state.deferralsLeft)) { state.later() }
                     .buttonStyle(SecondaryButton())
                     .disabled(state.isWaiting)
@@ -908,14 +908,12 @@ app.mainMenu = mainMenu
 let state = WindowState(request: request)
 let hosting = NSHostingView(rootView: AuthView(state: state))
 
-// The window has no title bar and no close button. The only ways out are the buttons, the timeout and the parent.
 let window = PromptWindow(
     contentRect: NSRect(x: 0, y: 0, width: 520, height: hosting.fittingSize.height),
     styleMask: [.borderless],
     backing: .buffered,
     defer: false
 )
-// The title is not shown, but VoiceOver reads it.
 window.title = Copy.title
 window.isMovableByWindowBackground = true
 window.isOpaque = false
@@ -924,9 +922,13 @@ window.hasShadow = true
 window.level = .floating
 window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 window.contentView = hosting
-window.center()
+let pointer = NSEvent.mouseLocation
+if let area = (NSScreen.screens.first { NSMouseInRect(pointer, $0.frame, false) } ?? NSScreen.main)?.visibleFrame {
+    window.setFrameOrigin(NSPoint(x: area.midX - window.frame.width / 2, y: area.midY - window.frame.height / 2 + area.height / 12))
+} else {
+    window.center()
+}
 
-// The backdrop goes up first, so the window is in front of it.
 let backdrop = Backdrop()
 if state.blockScreen {
     backdrop.show()
@@ -942,10 +944,8 @@ if state.blockScreen {
 window.makeKeyAndOrderFront(nil)
 app.activate(ignoringOtherApps: true)
 
-// Tell the parent that the user can see the window. The parent starts the deferral budget only after this line. Without it, the parent logs a failed window and ends the prompt.
 send(["event": "shown"])
 
-// The window is in front and has the keyboard now. Select the ASCII layout, then follow each later change of the layout.
 KeyboardLayout.selectASCII()
 state.layoutName = KeyboardLayout.nonASCIIName()
 DistributedNotificationCenter.default().addObserver(
@@ -954,7 +954,7 @@ DistributedNotificationCenter.default().addObserver(
     state.layoutName = KeyboardLayout.nonASCIIName()
 }
 
-// The commands of the parent arrive on a background thread. The end of stdin is the close signal. It also arrives when the parent dies, so the window cannot stay behind as an orphan that asks for a password.
+// Close on stdin EOF so the window exits if the parent exits.
 Thread.detachNewThread {
     while let line = readLine(strippingNewline: true) {
         guard let command = try? JSONDecoder().decode(WindowCommand.self, from: Data(line.utf8)) else { continue }

@@ -41,7 +41,7 @@ func NewAzureClientWithCredential(vaultURL string, cred azcore.TokenCredential, 
 }
 
 // readData returns the device's current secret map, or an empty map when the secret does not exist yet (HTTP 404).
-// Auth, permission, and connectivity errors are propagated so GoLAPS aborts before rotating.
+// It returns auth, permission, and connectivity errors so GoLAPS aborts before rotating.
 func (ac *AzureClient) readData(ctx context.Context, secretName string) (map[string]string, error) {
 	secretBundle, err := ac.client.GetSecret(ctx, secretName, "", nil)
 	if err != nil {
@@ -150,7 +150,7 @@ func (ac *AzureClient) StagePendingPassword(ctx context.Context, creds *Credenti
 	return nil
 }
 
-// ClearPendingPassword removes the staged value after a policy-rejected rotation.
+// ClearPendingPassword deletes the staged value after a policy-rejected rotation.
 func (ac *AzureClient) ClearPendingPassword(ctx context.Context, creds *Credentials, vaultID string) error {
 	if creds.ItemID == "" {
 		return nil
@@ -246,7 +246,7 @@ func (ac *AzureClient) UpsertCredentials(ctx context.Context, creds *Credentials
 	defer cancel()
 
 	secretName := fmt.Sprintf("laps-%s", deviceID)
-	// Read-modify-write so bridge_password and existing legacy_* fields survive until explicitly cleared.
+	// Read and update the existing secret so bridge_password and legacy_* fields survive until explicitly cleared.
 	secretData, err := ac.readData(ctx, secretName)
 	if err != nil {
 		return err

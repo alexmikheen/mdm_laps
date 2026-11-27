@@ -72,3 +72,73 @@ func TestRunLockRefusesASymlink(t *testing.T) {
 		t.Fatalf("acquire on symlink returned %v, want ELOOP", err)
 	}
 }
+
+func TestLocalLogOpenRefusesASymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "laps.log")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := openLogNoFollow(link)
+	if err == nil {
+		f.WriteString("leaked\n")
+		f.Close()
+		t.Fatal("the open followed a symlink")
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 0 {
+		t.Errorf("the target of the link received %q", data)
+	}
+}
+
+func TestLocalLogReadRefusesASymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "laps.log")
+	if err := os.WriteFile(target, []byte("not for the cap\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := readLogNoFollow(link); err == nil {
+		t.Fatalf("the read followed a symlink and returned %q", data)
+	}
+	if data, err := readLogNoFollow(target); err != nil || string(data) != "not for the cap\n" {
+		t.Fatalf("the read of a plain file gave %q, %v", data, err)
+	}
+}
+
+func TestLocalLogOpenCreatesAndAppends(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "laps.log")
+	for i := 0; i < 2; i++ {
+		f, err := openLogNoFollow(path)
+		if err != nil {
+			t.Fatalf("open %d: %v", i+1, err)
+		}
+		f.WriteString("run\n")
+		f.Close()
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Errorf("log mode = %o, want 600", mode)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "run\nrun\n" {
+		t.Errorf("log holds %q, want two appended lines", data)
+	}
+}

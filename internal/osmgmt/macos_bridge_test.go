@@ -498,3 +498,99 @@ func TestCleanupRemovesTokenlessBridgeWithoutTargetToken(t *testing.T) {
 		})
 	}
 }
+
+func TestWithBridgeAdminRestoresAdminMembershipOfExistingBridge(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		realName   string // empty means the login name laps-bridge
+		visible    bool   // IsHidden is absent from the record
+		member     bool
+		editFails  bool
+		wantEdit   bool
+		wantDelete bool
+		wantErr    bool
+	}{
+		{name: "a bridge outside the admin group is added back before the deletion", member: false, wantEdit: true, wantDelete: true},
+		{name: "a bridge in the admin group needs no edit", member: true, wantEdit: false, wantDelete: true},
+		{name: "a failed edit stops the heal before the deletion", member: false, editFails: true, wantEdit: true, wantDelete: false, wantErr: true},
+		{name: "a hidden LAPS bridge outside the admin group is promoted", realName: bridgeFullName, member: false, wantEdit: true, wantDelete: true},
+		{name: "a hidden legacy admin outside the admin group is promoted", realName: "laps-bridge", member: false, wantEdit: true, wantDelete: true},
+		{name: "a visible laps-bridge of a person is not promoted", realName: "John Doe", visible: true, member: false, wantEdit: false, wantDelete: false, wantErr: true},
+		{name: "a visible account with the RealName laps-bridge is not promoted", realName: "laps-bridge", visible: true, member: false, wantEdit: false, wantDelete: false, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			osState := &fakeOS{exists: map[string]bool{"localadmin": true, "laps-bridge": true}, token: map[string]bool{}, hidden: map[string]bool{"laps-bridge": !tt.visible}}
+			if tt.realName != "" {
+				osState.realName = map[string]string{"laps-bridge": tt.realName}
+			}
+			f := &fakeRunner{}
+			f.handle = func(c call) ([]byte, error) {
+				if out, err, ok := osState.handleCommon(c); ok {
+					return out, err
+				}
+				switch {
+				case c.is("dseditgroup", "-o", "checkmember", "-m", "laps-bridge", "admin"):
+					if tt.member {
+						return []byte("yes laps-bridge is a member of admin"), nil
+					}
+					return []byte("no laps-bridge is NOT a member of admin"), fakeExit{1}
+				case c.is("dseditgroup", "-o", "edit", "-a", "laps-bridge", "-t", "user", "admin"):
+					if tt.editFails {
+						return []byte("Operation failed"), fakeExit{1}
+					}
+					return nil, nil
+				case c.is("sysadminctl", "-deleteUser", "localadmin"):
+					delete(osState.exists, "localadmin")
+					osState.exists["localadmin"] = true // fn recreates the target at once in this test
+					return nil, nil
+				case c.is("sysadminctl", "-deleteUser", "laps-bridge"):
+					delete(osState.exists, "laps-bridge")
+					return nil, nil
+				}
+				t.Fatalf("unexpected command: %s", c)
+				return nil, nil
+			}
+
+			m := newTestManager(t, f)
+			var err error
+			logged := captureLog(func() {
+				err = m.withBridgeAdmin(context.Background(), "localadmin", func() error {
+					_, err := m.run.Run(context.Background(), "", toolSysadminctl, "-deleteUser", "localadmin")
+					return err
+				})
+			})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.visible {
+				if !strings.Contains(err.Error(), "not a LAPS bridge or the legacy admin") {
+					t.Fatalf("err = %v, want the identity refusal", err)
+				}
+				if f.indexOf("sysadminctl -deleteUser") >= 0 {
+					t.Fatalf("a refused promotion must delete nothing: %v", f.calls)
+				}
+			}
+			wantWarning := "[WARNING] The existing bridge admin laps-bridge is not in the admin group. The run adds it back before the heal."
+			if strings.Contains(logged, wantWarning) != tt.wantEdit {
+				t.Fatalf("re-add warning logged=%v, want %v: %s", !tt.wantEdit, tt.wantEdit, logged)
+			}
+			if strings.Contains(logged, "ExcludedAccounts") {
+				t.Fatalf("the bridge is temporary, so no log line may advise an exclusion for it: %s", logged)
+			}
+			wantPromoted := tt.wantEdit && !tt.editFails
+			if strings.Contains(logged, "[BRIDGE PROMOTED] laps-bridge was added back to the admin group for this heal.") != wantPromoted {
+				t.Fatalf("[BRIDGE PROMOTED] logged=%v, want %v: %s", !wantPromoted, wantPromoted, logged)
+			}
+			edit, del := f.indexOf("dseditgroup -o edit -a laps-bridge"), f.indexOf("sysadminctl -deleteUser localadmin")
+			if (edit >= 0) != tt.wantEdit {
+				t.Fatalf("edit issued=%v, want %v: %v", edit >= 0, tt.wantEdit, f.calls)
+			}
+			if (del >= 0) != tt.wantDelete {
+				t.Fatalf("deletion issued=%v, want %v: %v", del >= 0, tt.wantDelete, f.calls)
+			}
+			if tt.wantEdit && tt.wantDelete && edit > del {
+				t.Fatalf("the bridge must be back in the admin group before the target is deleted: %v", f.calls)
+			}
+		})
+	}
+}

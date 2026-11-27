@@ -4,5 +4,5 @@
 // Package version holds the GoLAPS release version.
 package version
 
-// Version is updated by scripts/build/build.sh during a release build; 0.0.0 is the source placeholder.
+// Version holds the release version that scripts/build/build.sh injects during a build.
 const Version = "0.0.0"

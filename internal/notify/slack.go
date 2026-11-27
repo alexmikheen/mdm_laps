@@ -86,7 +86,7 @@ func (s *SlackNotifier) SendPasswordRotation(hostname, serial, adminUser, status
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Post(s.webhookURL, "application/json", bytes.NewBuffer(payload))
 	if err != nil {
-		// Unwrap *url.Error so the secret webhook URL is never leaked into logs or error reports.
+		// Unwrap *url.Error so the secret webhook URL never leaks into logs or error reports.
 		var urlErr *url.Error
 		if errors.As(err, &urlErr) {
 			return fmt.Errorf("failed to send slack notification: %w", urlErr.Err)

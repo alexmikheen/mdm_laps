@@ -79,7 +79,7 @@ func draw(length int) ([]byte, error) {
 	}
 	count += MinSymbols
 
-	// Pick distinct positions with a partial Fisher-Yates shuffle so two symbols never land on the same index.
+	// Select distinct positions with a partial Fisher-Yates shuffle so two symbols never land on the same index.
 	positions := make([]int, length)
 	for i := range positions {
 		positions[i] = i

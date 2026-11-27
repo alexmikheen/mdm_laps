@@ -2,7 +2,7 @@
 
 ## Current SDK Versions in `go.mod`
 
-| Provider | SDK Package | Version | Go 1.26+ | Notes |
+| Provider | SDK Package | Version | Go 1.27+ | Notes |
 |----------|-------------|---------|----------|-------|
 | 1Password | `github.com/1password/onepassword-sdk-go` | `v0.4.1` | Yes | Uses WASM runtime (`wazero`) |
 | HashiCorp Vault | `github.com/hashicorp/vault/api` | `v1.23.0` | Yes | Supports KV v1 and KV v2 |

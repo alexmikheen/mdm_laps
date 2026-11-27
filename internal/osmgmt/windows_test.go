@@ -142,3 +142,60 @@ func TestVersionConstantExists(t *testing.T) {
 		t.Fatalf("internal/version/version.go carries no Version constant")
 	}
 }
+
+func TestPickWindowsSerialFallsBackPastAPlaceholder(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr string
+	}{
+		{"BIOS value wins", "BIOS=TESTSER0001\r\nCSP=TESTSER0002\r\n", "TESTSER0001", ""},
+		{"blank BIOS value", "BIOS=\r\nCSP=TESTSER0002\r\n", "TESTSER0002", ""},
+		{"placeholder BIOS value", "BIOS=Default string\r\nCSP=TESTSER0002\r\n", "TESTSER0002", ""},
+		{"O.E.M. placeholder BIOS value", "BIOS=To be filled by O.E.M.\nCSP=TESTSER0002", "TESTSER0002", ""},
+		{"UUID fallback when BIOS and CSP are placeholders", "BIOS=Default string\r\nCSP=To be filled by O.E.M.\r\nUUID=7967FCD2-0CE4-4C0E-AE6C-F66536181D11\r\n", "7967FCD2-0CE4-4C0E-AE6C-F66536181D11", ""},
+		{"all three are placeholders", "BIOS=Default string\r\nCSP=To be filled by O.E.M.\r\nUUID=FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF\r\n", "", `placeholder serial "Default string"`},
+		{"both are placeholders", "BIOS=Default string\r\nCSP=To be filled by O.E.M.\r\n", "", `placeholder serial "Default string"`},
+		{"both are blank", "BIOS=\r\nCSP=\r\n", "", "no serial"},
+		{"CLIXML noise before the tagged lines", "#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><Obj S=\"progress\"/></Objs>\r\nBIOS=TESTSER0001\r\nCSP=TESTSER0002\r\n", "TESTSER0001", ""},
+		{"noise only", "#< CLIXML\r\n<Objs Version=\"1.1.0.1\"></Objs>\r\n", "", "tagged"},
+		{"empty output", "", "", "tagged"},
+		{"untagged serial is ignored", "TESTSER0001\r\n", "", "tagged"},
+		{"valid BIOS and a different valid CSP", "BIOS=TESTSER0001\nCSP=TESTSER0099\n", "TESTSER0001", ""},
+		{"spaces around the tagged line", "  BIOS=TESTSER0001  \r\n", "TESTSER0001", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := pickWindowsSerial(tc.raw)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("pickWindowsSerial(%q) = %q, %v, want an error with %q", tc.raw, got, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("pickWindowsSerial(%q) = %q, %v, want %q", tc.raw, got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestSerialScriptPrintsBothFirmwareValues(t *testing.T) {
+	for _, class := range []string{"Win32_BIOS", "Win32_ComputerSystemProduct"} {
+		if !strings.Contains(serialScript, class) {
+			t.Errorf("the serial script does not read %s", class)
+		}
+	}
+	for _, want := range []string{"$ProgressPreference = 'SilentlyContinue'", "BIOS=", "CSP=", "UUID="} {
+		if !strings.Contains(serialScript, want) {
+			t.Errorf("the serial script lacks %s", want)
+		}
+	}
+	if strings.Index(serialScript, "BIOS=") > strings.Index(serialScript, "CSP=") || strings.Index(serialScript, "CSP=") > strings.Index(serialScript, "UUID=") {
+		t.Error("the tagged lines must appear in BIOS, CSP, UUID order")
+	}
+	if strings.Contains(serialScript, "IsNullOrWhiteSpace") {
+		t.Error("the script picks the serial itself, so a placeholder never reaches the Go check")
+	}
+}

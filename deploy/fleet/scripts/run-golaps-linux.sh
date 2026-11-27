@@ -42,7 +42,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Verify that the binary and every parent directory are root-owned, non-symlink,
+# Check that the binary and every parent directory are root-owned, non-symlink,
 # and not writable by group or other.
 verify_trusted_binary() {
     local target="$1"
@@ -77,7 +77,7 @@ verify_trusted_binary() {
     return 0
 }
 
-# Abort if placeholder configuration values were left unedited.
+# Abort if the administrator did not edit the placeholder configuration values.
 if [ -z "$LAPS_ADMIN_USER" ] || [ "$LAPS_ADMIN_USER" = "example-admin" ]; then
     echo "[ERROR] LAPS_ADMIN_USER is empty or still set to the placeholder value 'example-admin'." >&2
     exit 1
@@ -99,7 +99,7 @@ if [ "$GOLAPS_SECRET_LEGACY" = '$''FLEET_SECRET_GOLAPS_LEGACY_PASS' ]; then
     GOLAPS_SECRET_LEGACY=""
 fi
 
-# Confirm binary integrity before running GoLAPS as root.
+# Check binary integrity before running GoLAPS as root.
 if ! verify_trusted_binary "$LAPS_BINARY"; then
     echo "[ERROR] Refusing to run untrusted binary $LAPS_BINARY." >&2
     exit 1

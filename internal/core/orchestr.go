@@ -61,7 +61,7 @@ func rotationCandidates(creds *vault.Credentials, legacyPass string) []string {
 	return out
 }
 
-// settleCandidates confirms a live pending password in the vault before staging a new one.
+// settleCandidates checks a live pending password in the vault before staging a new one.
 func settleCandidates(ctx context.Context, cfg *config.Config, osMgr osmgmt.Manager, vaultClient vault.Client, creds *vault.Credentials, serialNumber, hostname string) ([]string, error) {
 	full := rotationCandidates(creds, cfg.LegacyAdminPass)
 	if creds.PendingPassword == "" {
@@ -76,10 +76,12 @@ func settleCandidates(ctx context.Context, cfg *config.Config, osMgr osmgmt.Mana
 			return full, nil
 		}
 		if err != nil {
-			if creds.PreviousPendingPassword != "" {
-				return nil, fmt.Errorf("could not verify stored password candidates for %s while a previous pending password is still unconfirmed, aborting before staging: %w", cfg.AdminUser, err)
+			// A verification error is a helper failure, so stop red before the staging while two unconfirmed values exist.
+			previous := creds.PreviousPendingPassword
+			if previous != "" && previous != creds.PendingPassword && previous != creds.OldPassword {
+				return nil, fmt.Errorf("could not verify the stored password candidates for %s while two unconfirmed values exist in the vault record, aborting before staging: %w", cfg.AdminUser, err)
 			}
-			log.Printf("[WARNING] Could not verify the stored password candidates for %s (%v); the rotation tries remaining candidates in order.\n", cfg.AdminUser, err)
+			log.Printf("[WARNING] Could not verify the stored password candidates for %s (%v); the rotation tries the %d candidates that are not proven wrong, in order.\n", cfg.AdminUser, err, len(full)-len(verified))
 			remaining := []string{}
 			for _, v := range full {
 				if !verified[v] {

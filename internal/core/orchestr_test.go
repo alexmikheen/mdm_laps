@@ -33,24 +33,26 @@ func (r *recorder) indexOf(step string) int {
 }
 
 type fakeManager struct {
-	rec *recorder
+	rec            *recorder
 	seenCandidates []string
-	sysInfoErr  error
-	rotateErr   error
-	tokenStatus string
-	rotatedPass string
-	cleanupAbsent bool
-	escrow        osmgmt.BridgeEscrow
-	seenCreds map[string]string
-	verifyLive   map[string]bool
-	verifyErr    error
-	seenVerified []string
+	sysInfoErr     error
+	rotateErr      error
+	tokenStatus    string
+	rotatedPass    string
+	cleanupAbsent  bool
+	escrow         osmgmt.BridgeEscrow
+	seenCreds      map[string]string
+	verifyLive     map[string]bool
+	verifyErr      error
+	seenVerified   []string
+	// verifyErrAt is the 1-based call that returns verifyErr, and zero means every call returns it.
+	verifyErrAt int
 }
 
 func (f *fakeManager) VerifyPassword(ctx context.Context, user, pass string) (bool, error) {
 	f.rec.record("VerifyPassword")
 	f.seenVerified = append(f.seenVerified, pass)
-	if f.verifyErr != nil {
+	if f.verifyErr != nil && (f.verifyErrAt == 0 || f.verifyErrAt == len(f.seenVerified)) {
 		return false, f.verifyErr
 	}
 	return f.verifyLive[pass], nil
@@ -668,5 +670,67 @@ func TestRunLAPSAbortsWhenConfirmWriteFails(t *testing.T) {
 		if rec.indexOf(step) != -1 {
 			t.Fatalf("%s ran although the vault refused the confirm write: %v", step, rec.calls)
 		}
+	}
+}
+
+func TestRunLAPSVerificationErrorAbortsWithTwoUnconfirmedValues(t *testing.T) {
+	rec := &recorder{}
+	mgr := &fakeManager{rec: rec, verifyErr: errors.New("fork/exec: no such file")}
+	v := &fakeVault{rec: rec, creds: &vault.Credentials{ItemID: "item1", OldPassword: "recorded", PendingPassword: "P2", PreviousPendingPassword: "P1"}}
+
+	err := RunLAPS(context.Background(), testConfig(), mgr, v)
+	if err == nil || !strings.Contains(err.Error(), "aborting before staging") {
+		t.Fatalf("RunLAPS must stop before the staging, got: %v", err)
+	}
+	for _, step := range []string{"StagePendingPassword", "EnsureUserAndChangePassword", "ConfirmLivePassword"} {
+		if rec.indexOf(step) != -1 {
+			t.Fatalf("%s ran although the candidates could not be verified: %v", step, rec.calls)
+		}
+	}
+}
+
+func TestRunLAPSDuplicatePendingValuesCountAsOne(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		previous string
+	}{
+		{name: "previous pending equals pending", previous: "P1"},
+		{name: "previous pending equals recorded", previous: "recorded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &recorder{}
+			mgr := &fakeManager{rec: rec, verifyLive: map[string]bool{}, verifyErr: errors.New("helper timeout"), verifyErrAt: 2}
+			v := &fakeVault{rec: rec, creds: &vault.Credentials{ItemID: "item1", OldPassword: "recorded", PendingPassword: "P1", PreviousPendingPassword: tc.previous}}
+			cfg := testConfig()
+			cfg.LegacyAdminPass = "enrollment"
+
+			if err := RunLAPS(context.Background(), cfg, mgr, v); err != nil {
+				t.Fatalf("RunLAPS must not stop for one unconfirmed value stored twice: %v", err)
+			}
+			if !reflect.DeepEqual(mgr.seenCandidates, []string{"recorded", "enrollment"}) {
+				t.Fatalf("candidates = %q, want [recorded enrollment]: P1 was proven wrong before the error", mgr.seenCandidates)
+			}
+		})
+	}
+}
+
+func TestRunLAPSVerificationErrorDropsTheProvenWrongCandidates(t *testing.T) {
+	rec := &recorder{}
+	mgr := &fakeManager{rec: rec, verifyLive: map[string]bool{}, verifyErr: errors.New("helper timeout"), verifyErrAt: 2}
+	v := &fakeVault{rec: rec, creds: &vault.Credentials{ItemID: "item1", OldPassword: "recorded", PendingPassword: "P1"}}
+	cfg := testConfig()
+	cfg.LegacyAdminPass = "enrollment"
+
+	if err := RunLAPS(context.Background(), cfg, mgr, v); err != nil {
+		t.Fatalf("RunLAPS returned an error: %v", err)
+	}
+	if !reflect.DeepEqual(mgr.seenVerified, []string{"P1", "recorded"}) {
+		t.Fatalf("verified %q, want P1 proven wrong and the error on recorded", mgr.seenVerified)
+	}
+	if !reflect.DeepEqual(mgr.seenCandidates, []string{"recorded", "enrollment"}) {
+		t.Fatalf("candidates = %q, want the proven-wrong P1 absent and the rest in order", mgr.seenCandidates)
+	}
+	if rec.indexOf("StagePendingPassword") == -1 || rec.indexOf("EnsureUserAndChangePassword") == -1 {
+		t.Fatalf("one unconfirmed value lets the run continue: %v", rec.calls)
 	}
 }

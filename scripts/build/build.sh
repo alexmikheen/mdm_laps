@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: MIT
 
 # Build GoLAPS for macOS (arm64), Windows (amd64), and Linux (amd64, arm64) and package the macOS .pkg.
+cd "$(dirname "$0")/../.." || exit 1
 
 PKG_IDENTIFIER="io.github.golaps.mdm-laps"
 MAC_ARCH="arm64"
@@ -108,10 +109,14 @@ CURRENT_VERSION=""
 NEXT_VERSION="1.0.0"
 
 if [ -d "$RELEASE_DIR" ]; then
-    EXISTING_FILE=$(ls "$RELEASE_DIR" 2>/dev/null | grep -E 'v[0-9]+\.[0-9]+\.[0-9]+\.(pkg|exe)' | head -n 1)
+    EXISTING_FILE=$(ls "$RELEASE_DIR" 2>/dev/null | grep -E 'v[0-9]+\.[0-9]+\.[0-9]+(_[0-9]+)?\.(pkg|exe)' | head -n 1)
     if [ -n "$EXISTING_FILE" ]; then
-        CURRENT_VERSION=$(echo "$EXISTING_FILE" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-        NEXT_VERSION=$(echo "$CURRENT_VERSION" | awk -F. -v OFS=. '{$NF += 1 ; print}')
+        CURRENT_VERSION=$(echo "$EXISTING_FILE" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(_[0-9]+)?' | head -n 1)
+        if [[ "$CURRENT_VERSION" == *_* ]]; then
+            NEXT_VERSION="${CURRENT_VERSION%_*}_$(( ${CURRENT_VERSION##*_} + 1 ))"
+        else
+            NEXT_VERSION=$(echo "$CURRENT_VERSION" | awk -F. -v OFS=. '{$NF += 1 ; print}')
+        fi
     fi
 fi
 
@@ -194,6 +199,10 @@ fi
 go mod download || log_error_and_exit "Failed to download Go dependencies pinned in go.mod."
 go mod verify || log_error_and_exit "Go module checksums do not match go.sum."
 
+log_message "Running go vet and the Go tests..."
+go vet ./... || log_error_and_exit "go vet found a problem. The build stops before it makes a package."
+go test ./... || log_error_and_exit "A Go test failed. The build stops before it makes a package."
+
 log_message "Cleaning up old build artifacts..."
 rm -rf "$RELEASE_DIR" || log_error_and_exit "Failed to remove old release directory."
 PAYLOAD_ROOT="$RELEASE_DIR/payload"
@@ -248,6 +257,8 @@ else
 fi
 
 [ -f "$PAYLOAD_ROOT$MAC_BINARY_PATH" ] || log_error_and_exit "Payload is missing $MAC_BINARY_PATH — the audit script would never pass."
+[ -f "$PAYLOAD_ROOT$MAC_HELPER_PATH" ] || log_error_and_exit "Payload is missing $MAC_HELPER_PATH. The audit script would never pass."
+[ -f "$PAYLOAD_ROOT$MAC_AUTH_WINDOW_PATH" ] || log_error_and_exit "Payload is missing $MAC_AUTH_WINDOW_PATH. The audit script would never pass."
 
 # Sign macOS binaries with explicit bundle IDs and Hardened Runtime.
 # Set CODESIGN_IDENTITY and INSTALLER_IDENTITY for production MDM releases.

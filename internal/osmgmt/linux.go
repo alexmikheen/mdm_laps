@@ -122,7 +122,7 @@ func probeLinuxEndpoint(ctx context.Context, probeURL string) error {
 	return nil
 }
 
-// Preflight verifies root privilege and optional vault endpoint reachability.
+// Preflight checks root privilege and optional vault endpoint reachability.
 func (m *LinuxManager) Preflight(ctx context.Context, user, probeURL string) error {
 	if euid := m.geteuid(); euid != 0 {
 		return fmt.Errorf("GoLAPS must run as root (current euid=%d)", euid)
@@ -151,7 +151,7 @@ func (m *LinuxManager) GetSystemInfo(ctx context.Context) (string, string, error
 	return hostname, serial, nil
 }
 
-// EnsureUserAndChangePassword provisions a local managed user, rotates its password via chpasswd stdin, unlocks it, disables expiry, grants admin membership, and verifies sudo escalation.
+// EnsureUserAndChangePassword provisions a local managed user, rotates its password via chpasswd stdin, unlocks it, disables expiry, grants admin membership, and checks sudo escalation.
 func (m *LinuxManager) EnsureUserAndChangePassword(ctx context.Context, user string, candidates []string, newPass string) error {
 	if err := validateChpasswdInput(user, newPass); err != nil {
 		return err
