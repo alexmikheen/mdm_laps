@@ -205,15 +205,12 @@ func TestEffectiveRunBudgetTakesTheStartupDelayOff(t *testing.T) {
 
 func mainFunction(t *testing.T) string {
 	t.Helper()
-	src, err := os.ReadFile("main.go")
-	if err != nil {
-		t.Fatalf("cannot read main.go: %v", err)
-	}
-	start := strings.Index(string(src), "\nfunc main() {")
+	src := readRepoFile(t, "cmd/main.go")
+	start := strings.Index(src, "\nfunc main() {")
 	if start < 0 {
 		t.Fatal("main.go has no func main")
 	}
-	body := string(src[start:])
+	body := src[start:]
 	end := strings.Index(body, "\n}\n")
 	if end < 0 {
 		t.Fatal("func main has no closing brace in column one")
@@ -235,11 +232,7 @@ func TestMainTakesTheRunLockBeforeTheLog(t *testing.T) {
 }
 
 func TestTriggerScriptStaysThin(t *testing.T) {
-	src, err := os.ReadFile(filepath.Join("..", "scripts", "mdm", "macos", "laps_token.sh"))
-	if err != nil {
-		t.Fatalf("cannot read laps_token.sh: %v", err)
-	}
-	script := string(src)
+	script := readRepoFile(t, filepath.Join("scripts", "mdm", "macos", "laps_token.sh"))
 
 	// "sleep" stays out of this list because the startup delay is a scheduling step, not a repair.
 	for _, forbidden := range []string{"dscl", "pwpolicy", "security ", "dseditgroup", "pmset", "curl", "sysadminctl", "tail -n", "chmod"} {
@@ -275,11 +268,7 @@ func TestTriggerScriptStaysThin(t *testing.T) {
 
 func trustedPathFunction(t *testing.T) (script, function string) {
 	t.Helper()
-	src, err := os.ReadFile(filepath.Join("..", "scripts", "mdm", "macos", "laps_token.sh"))
-	if err != nil {
-		t.Fatalf("cannot read laps_token.sh: %v", err)
-	}
-	script = string(src)
+	script = readRepoFile(t, filepath.Join("scripts", "mdm", "macos", "laps_token.sh"))
 	start := strings.Index(script, "trusted_path() {")
 	if start < 0 {
 		t.Fatal("laps_token.sh has no trusted_path function")
@@ -359,11 +348,15 @@ func TestTrustedPathOfTheTrigger(t *testing.T) {
 
 func readRepoFile(t *testing.T, relPath string) string {
 	t.Helper()
-	src, err := os.ReadFile(filepath.Join("..", relPath))
+	path := filepath.Join("..", relPath)
+	if strings.HasPrefix(relPath, "cmd/") || strings.HasPrefix(relPath, `cmd\`) {
+		path = strings.TrimPrefix(strings.TrimPrefix(relPath, "cmd/"), `cmd\`)
+	}
+	src, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("cannot read %s: %v", relPath, err)
 	}
-	return string(src)
+	return strings.ReplaceAll(string(src), "\r\n", "\n")
 }
 
 func TestInstallPathsAgree(t *testing.T) {

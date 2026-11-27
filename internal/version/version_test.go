@@ -16,7 +16,7 @@ func TestVersionConstantIsInjectable(t *testing.T) {
 		t.Fatalf("read version.go: %v", err)
 	}
 	var lines []string
-	for _, line := range strings.Split(string(data), "\n") {
+	for _, line := range strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
 		if strings.HasPrefix(line, `const Version = "`) {
 			lines = append(lines, line)
 		}
